@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -156,6 +157,205 @@ func TestValidID(t *testing.T) {
 	for _, tt := range tests {
 		if got := ValidID(tt.in); got != tt.want {
 			t.Errorf("ValidID(%q): got %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+// rec builds the record that changes the set have into have+added-removed.
+func rec(have map[string]bool, added, removed []string) *Record {
+	next := []string{}
+	for k := range have {
+		next = append(next, k)
+	}
+
+	next = append(next, added...)
+
+	var kept []string
+
+	for _, k := range next {
+		drop := false
+		for _, r := range removed {
+			drop = drop || r == k
+		}
+
+		if !drop {
+			kept = append(kept, k)
+		}
+	}
+
+	return &Record{
+		Time: time.Date(2026, 10, 2, 0, 0, len(have), 0, time.UTC), Tool: "restic",
+		Count: len(kept), Set: SetHash(kept), Added: added, Removed: removed,
+	}
+}
+
+func TestReplay(t *testing.T) {
+	a, b, c := id(1), id(2), id(3)
+	r0 := rec(map[string]bool{}, []string{a}, nil)
+	r1 := rec(map[string]bool{a: true}, []string{b}, nil)
+	r2 := rec(map[string]bool{a: true, b: true}, []string{c}, []string{a})
+	r3 := rec(map[string]bool{b: true, c: true}, nil, nil)
+	r3.Time = r3.Time.Add(time.Hour)
+
+	s, err := Replay([][]byte{r0.Marshal(), r1.Marshal(), r2.Marshal(), r3.Marshal()})
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+
+	if s.Size != 4 {
+		t.Fatalf("size: got %d, want 4", s.Size)
+	}
+
+	want := []string{b, c}
+	if want[0] > want[1] {
+		want[0], want[1] = want[1], want[0]
+	}
+
+	if got := s.Sorted(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("sorted: got %v, want %v", got, want)
+	}
+
+	if got := s.IDs[c]; got.Index != 2 || !got.Time.Equal(r2.Time) {
+		t.Fatalf("seen c: got %+v, want index 2 time %v", got, r2.Time)
+	}
+
+	if !reflect.DeepEqual(s.Last, r3) {
+		t.Fatalf("last: got %+v, want %+v", s.Last, r3)
+	}
+
+	if len(s.History) != 4 || s.History[0] != r0.Set || s.History[3] != r3.Set {
+		t.Fatalf("history: got %x", s.History)
+	}
+
+	if got := s.MatchIndex(r3.Set); got != 3 {
+		t.Fatalf("match r3: got %d, want 3 (last of 2 and 3)", got)
+	}
+
+	if got := s.MatchIndex(r0.Set); got != 0 {
+		t.Fatalf("match r0: got %d, want 0", got)
+	}
+
+	if got := s.MatchIndex(SetHash([]string{c})); got != -1 {
+		t.Fatalf("match unknown: got %d, want -1", got)
+	}
+
+	empty, err := Replay(nil)
+	if err != nil || empty.Size != 0 || empty.Last != nil || len(empty.IDs) != 0 {
+		t.Fatalf("empty replay: got %+v, %v", empty, err)
+	}
+}
+
+func TestReplayErrors(t *testing.T) {
+	a, b := id(1), id(2)
+	r0 := rec(map[string]bool{}, []string{a}, nil)
+	one := map[string]bool{a: true}
+
+	badCount := rec(one, []string{b}, nil)
+	badCount.Count = 3
+	badSet := rec(one, []string{b}, nil)
+	badSet.Set = SetHash([]string{b})
+
+	tests := []struct {
+		name    string
+		second  []byte
+		wantErr string
+	}{
+		{"parse error", []byte("garbage\n"), "entry 1"},
+		{"add known id", rec(one, []string{a}, nil).Marshal(), "record 1: adds known id"},
+		{"remove unknown id", rec(one, nil, []string{b}).Marshal(), "record 1: removes unknown id"},
+		{"count mismatch", badCount.Marshal(), "record 1: set has 2 ids, record says 3"},
+		{"set mismatch", badSet.Marshal(), "record 1: set hash"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Replay([][]byte{r0.Marshal(), tt.second, r0.Marshal()})
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("got %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestApply(t *testing.T) {
+	a, b := id(1), id(2)
+
+	s := NewState()
+	if err := s.Apply(1, rec(map[string]bool{}, []string{a}, nil)); err == nil {
+		t.Fatal("index 1 on empty state: got nil, want error")
+	}
+
+	if err := s.Apply(0, rec(map[string]bool{}, []string{a}, nil)); err != nil {
+		t.Fatalf("apply 0: %v", err)
+	}
+
+	// A failed apply must leave the state as it was
+	bad := rec(map[string]bool{a: true}, []string{b}, []string{a})
+	bad.Count = 5
+
+	if err := s.Apply(1, bad); err == nil {
+		t.Fatal("bad count: got nil, want error")
+	}
+
+	if s.Size != 1 || len(s.IDs) != 1 || len(s.History) != 1 {
+		t.Fatalf("state changed after failed apply: %+v", s)
+	}
+
+	if _, ok := s.IDs[a]; !ok {
+		t.Fatal("state lost id a after failed apply")
+	}
+}
+
+func TestDiff(t *testing.T) {
+	a, b, c, d := id(1), id(2), id(3), id(4)
+	have := map[string]Seen{a: {}, b: {}, c: {}}
+
+	added, removed := Diff(have, []string{d, b, a})
+	if !reflect.DeepEqual(added, []string{d}) {
+		t.Fatalf("added: got %v, want [%s]", added, d)
+	}
+
+	if !reflect.DeepEqual(removed, []string{c}) {
+		t.Fatalf("removed: got %v, want [%s]", removed, c)
+	}
+
+	added, removed = Diff(have, []string{c, b, a})
+	if added != nil || removed != nil {
+		t.Fatalf("same set: got %v %v, want nil, nil", added, removed)
+	}
+
+	added, removed = Diff(nil, []string{c, a, b})
+	want := []string{a, b, c}
+	slices.Sort(want)
+
+	if !reflect.DeepEqual(added, want) || removed != nil {
+		t.Fatalf("from empty: got %v %v, want %v nil", added, removed, want)
+	}
+}
+
+func BenchmarkReplay(b *testing.B) {
+	const n = 5000
+
+	entries := make([][]byte, n)
+
+	var ids []string
+
+	for i := range n {
+		ids = append(ids, id(i))
+		r := &Record{
+			Time:  time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Hour),
+			Tool:  "restic 0.19.1",
+			Count: len(ids),
+			Set:   SetHash(ids),
+			Added: []string{id(i)},
+		}
+		entries[i] = r.Marshal()
+	}
+
+	b.ResetTimer()
+
+	for b.Loop() {
+		if _, err := Replay(entries); err != nil {
+			b.Fatal(err)
 		}
 	}
 }
