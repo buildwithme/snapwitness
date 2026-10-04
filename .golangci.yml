@@ -17,6 +17,12 @@ linters:
     - gosec
     - revive
     - wsl_v5
+  exclusions:
+    rules:
+      # Tests write fixtures under t.TempDir() with fixed paths and modes
+      - path: _test\.go
+        linters:
+          - gosec
 
 formatters:
   enable:
