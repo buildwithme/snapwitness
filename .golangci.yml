@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  default: none
+  settings:
+    wsl_v5:
+      enable:
+        - after-block
+        - cuddle-group
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - unused
+    - errorlint
+    - gosec
+    - revive
+    - wsl_v5
+
+formatters:
+  enable:
+    - gofumpt
+    - golines
+    - goimports
+  settings:
+    golines:
+      max-len: 120
+    goimports:
+      local-prefixes:
+        - github.com/buildwithme/snapwitness
