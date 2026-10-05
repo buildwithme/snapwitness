@@ -23,6 +23,10 @@ linters:
       - path: _test\.go
         linters:
           - gosec
+      # Paths come from the caller or are ValidID-checked names
+      - linters:
+          - gosec
+        text: G304
 
 formatters:
   enable:

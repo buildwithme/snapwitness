@@ -1,10 +1,14 @@
 package restic
 
 import (
+	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -134,5 +138,180 @@ func TestSnapshotsMissingBinary(t *testing.T) {
 	c := &CLI{Bin: filepath.Join(t.TempDir(), "nope"), Repo: "r"}
 	if _, err := c.Snapshots(t.Context()); err == nil {
 		t.Fatal("got nil, want error for a missing binary")
+	}
+}
+
+func writeSnapshot(t testing.TB, dir string, content []byte) string {
+	t.Helper()
+
+	sum := sha256.Sum256(content)
+
+	name := hex.EncodeToString(sum[:])
+	if err := os.WriteFile(filepath.Join(dir, name), content, 0o400); err != nil {
+		t.Fatal(err)
+	}
+
+	return name
+}
+
+func TestList(t *testing.T) {
+	repo := t.TempDir()
+
+	dir := filepath.Join(repo, "snapshots")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var ids []string
+	for i := range 20 {
+		ids = append(ids, writeSnapshot(t, dir, []byte(fmt.Sprintf("snapshot %02d padded to at least 32 bytes", i))))
+	}
+
+	slices.Sort(ids)
+
+	// The name claims one content while the file holds another
+	mismatch := hexID(99)
+	if err := os.WriteFile(
+		filepath.Join(dir, mismatch),
+		[]byte("swapped content, still 32 bytes or more"),
+		0o400,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	foreign := "notes.txt"
+	if err := os.WriteFile(filepath.Join(dir, foreign), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	short := writeSnapshot(t, dir, []byte("12345"))
+	if err := os.Mkdir(filepath.Join(dir, hexID(100)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var bytes int64
+
+	for _, id := range ids {
+		info, err := os.Stat(filepath.Join(dir, id))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		bytes += info.Size()
+	}
+
+	bytes += int64(len("swapped content, still 32 bytes or more")) + 5 + 5
+
+	for _, workers := range []int{0, 1, 4} {
+		t.Run(fmt.Sprintf("workers=%d", workers), func(t *testing.T) {
+			l, err := List(t.Context(), repo, workers)
+			if err != nil {
+				t.Fatalf("list: %v", err)
+			}
+
+			if !reflect.DeepEqual(l.IDs, ids) {
+				t.Errorf("ids: got %v, want %v", l.IDs, ids)
+			}
+
+			if !reflect.DeepEqual(l.Mismatch, []string{mismatch}) {
+				t.Errorf("mismatch: got %v, want [%s]", l.Mismatch, mismatch)
+			}
+
+			if !reflect.DeepEqual(l.Foreign, []string{foreign}) {
+				t.Errorf("foreign: got %v, want [%s]", l.Foreign, foreign)
+			}
+
+			if !reflect.DeepEqual(l.TooShort, []string{short}) {
+				t.Errorf("too short: got %v, want [%s]", l.TooShort, short)
+			}
+
+			if l.Files != 23 {
+				t.Errorf("files: got %d, want 23", l.Files)
+			}
+
+			if l.Bytes != bytes {
+				t.Errorf("bytes: got %d, want %d", l.Bytes, bytes)
+			}
+		})
+	}
+}
+
+func TestListEmpty(t *testing.T) {
+	repo := t.TempDir()
+	if err := os.Mkdir(filepath.Join(repo, "snapshots"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := List(t.Context(), repo, 2)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if l.IDs != nil || l.Files != 0 || l.Bytes != 0 {
+		t.Fatalf("got %+v, want an empty listing", l)
+	}
+}
+
+func TestListErrors(t *testing.T) {
+	if _, err := List(t.Context(), t.TempDir(), 1); err == nil {
+		t.Fatal("missing snapshots dir: got nil, want error")
+	}
+
+	repo := t.TempDir()
+
+	dir := filepath.Join(repo, "snapshots")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeSnapshot(t, dir, []byte("one snapshot file of at least 32 bytes"))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err := List(ctx, repo, 1); err == nil {
+		t.Fatal("cancelled context: got nil, want error")
+	}
+
+	unreadable := writeSnapshot(t, dir, []byte("a file the lister cannot open, 32+ bytes"))
+	if err := os.Chmod(filepath.Join(dir, unreadable), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	if os.Getuid() != 0 {
+		if _, err := List(t.Context(), repo, 2); err == nil {
+			t.Fatal("unreadable file: got nil, want error")
+		}
+	}
+}
+
+func BenchmarkList(b *testing.B) {
+	repo := b.TempDir()
+
+	dir := filepath.Join(repo, "snapshots")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		b.Fatal(err)
+	}
+
+	for i := range 2000 {
+		writeSnapshot(
+			b,
+			dir,
+			[]byte(fmt.Sprintf("snapshot file %05d, about 500 bytes like restic %s", i, strings.Repeat("p", 450))),
+		)
+	}
+
+	for _, workers := range []int{1, 8} {
+		b.Run(fmt.Sprintf("workers=%d", workers), func(b *testing.B) {
+			for b.Loop() {
+				l, err := List(b.Context(), repo, workers)
+				if err != nil {
+					b.Fatal(err)
+				}
+
+				if len(l.IDs) != 2000 {
+					b.Fatalf("got %d ids, want 2000", len(l.IDs))
+				}
+			}
+		})
 	}
 }
