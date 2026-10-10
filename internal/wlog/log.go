@@ -27,10 +27,17 @@ const (
 const (
 	// frameHeader is the 4-byte big-endian length in front of every entry.
 	frameHeader = 4
+	// maxCheckpointSize bounds the checkpoint read back from the storage.
+	maxCheckpointSize = 1 << 20
 )
 
-// ErrNoLog is returned by Open when the entries file is missing.
-var ErrNoLog = errors.New("wlog: no log")
+var (
+	// ErrNoCheckpoint is returned by ReadCheckpoint when no checkpoint has been
+	// written yet.
+	ErrNoCheckpoint = errors.New("wlog: no checkpoint")
+	// ErrNoLog is returned by Open when the entries file is missing.
+	ErrNoLog = errors.New("wlog: no log")
+)
 
 // Log is an append-only Merkle log kept in one directory next to the backup
 // repository.
@@ -196,6 +203,59 @@ func (l *Log) Consistency(from, to int64) ([]tlog.Hash, error) {
 	}
 
 	return p, nil
+}
+
+// ReadCheckpoint returns the stored signed checkpoint note, or ErrNoCheckpoint.
+func (l *Log) ReadCheckpoint() ([]byte, error) {
+	b, err := readRegular(filepath.Join(l.dir, CheckpointFile), maxCheckpointSize)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, ErrNoCheckpoint
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("wlog: read checkpoint: %w", err)
+	}
+
+	return b, nil
+}
+
+// WriteCheckpoint replaces the stored checkpoint with signed, by temp file
+// and rename. After a crash there's either the old one or the new one.
+func (l *Log) WriteCheckpoint(signed []byte) error {
+	f, err := os.CreateTemp(l.dir, CheckpointFile+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("wlog: write checkpoint: %w", err)
+	}
+
+	tmp := f.Name()
+
+	err = f.Chmod(0o644)
+	if err == nil {
+		_, err = f.Write(signed)
+	}
+
+	if err == nil {
+		err = f.Sync()
+	}
+
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(l.dir, CheckpointFile))
+	}
+
+	if err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("wlog: write checkpoint: %w", err)
+	}
+
+	if err := syncDir(l.dir); err != nil {
+		return fmt.Errorf("wlog: write checkpoint: %w", err)
+	}
+
+	return nil
 }
 
 // reader serves tlog the hashes rebuilt in memory.

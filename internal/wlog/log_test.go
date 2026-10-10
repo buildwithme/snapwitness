@@ -313,6 +313,75 @@ func TestRootAndConsistency(t *testing.T) {
 	}
 }
 
+func TestCheckpointFile(t *testing.T) {
+	l := newLog(t)
+	if _, err := l.ReadCheckpoint(); !errors.Is(err, ErrNoCheckpoint) {
+		t.Fatalf("got %v, want ErrNoCheckpoint", err)
+	}
+
+	for _, want := range []string{"first\n", "second\n"} {
+		if err := l.WriteCheckpoint([]byte(want)); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := l.ReadCheckpoint()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if string(got) != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+
+	st, err := os.Stat(filepath.Join(l.Dir(), CheckpointFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := st.Mode().Perm(); got != 0o644 {
+		t.Errorf("got mode %v, want 0644", got)
+	}
+
+	assertFiles(t, l.Dir(), CheckpointFile, EntriesFile)
+}
+
+func TestWriteCheckpointRemovesTemp(t *testing.T) {
+	l := newLog(t)
+	// a file can't replace a non-empty directory; the rename fails
+	if err := os.MkdirAll(filepath.Join(l.Dir(), CheckpointFile, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := l.WriteCheckpoint([]byte("note\n")); err == nil {
+		t.Fatal("got nil error, want one")
+	}
+
+	assertFiles(t, l.Dir(), CheckpointFile, EntriesFile)
+
+	if _, err := l.ReadCheckpoint(); err == nil || errors.Is(err, ErrNoCheckpoint) {
+		t.Errorf("read a directory: got %v, want a not a regular file error", err)
+	}
+}
+
+func assertFiles(t *testing.T, dir string, want ...string) {
+	t.Helper()
+
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	for _, de := range des {
+		got = append(got, de.Name())
+	}
+
+	if !slices.Equal(got, want) {
+		t.Errorf("got files %q, want %q", got, want)
+	}
+}
+
 func BenchmarkOpen(b *testing.B) {
 	dir := b.TempDir()
 	entry := bytes.Repeat([]byte{'x'}, 200)
