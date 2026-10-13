@@ -177,11 +177,3 @@ func excerpt(b []byte) []byte {
 
 	return b
 }
-
-// Request is one checkpoint to be cosigned.
-type Request struct {
-	Signed  []byte // note with the log signature only
-	Size    int64
-	OldSize int64                                 // size the witnesses are expected to have
-	Proof   func(from int64) ([]tlog.Hash, error) // consistency proof from `from` to Size
-}
