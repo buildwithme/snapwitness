@@ -426,8 +426,12 @@ func TestCollectErrors(t *testing.T) {
 				t.Fatalf("got no error, want one")
 			}
 
-			if !strings.Contains(o.Err.Error(), w.Name) {
-				t.Errorf("error %q does not name the witness %s", o.Err, w.Name)
+			if !strings.HasPrefix(o.Err.Error(), "witness: "+w.Name+": ") {
+				t.Errorf("error %q does not start with the witness name %s", o.Err, w.Name)
+			}
+
+			if n := strings.Count(o.Err.Error(), "witness: "); n != 1 {
+				t.Errorf("error %q: got the prefix %d times, want once", o.Err, n)
 			}
 
 			if tt.want != nil {
@@ -585,24 +589,6 @@ func TestAddCheckpointAnswers(t *testing.T) {
 	signer, vkey := newLogKey(t)
 	l := newTestLog(t, signer, vkey, 2, "a")
 	req := l.request(t, 0, 2)
-	other, _ := newCosigKey(t, "w1")
-
-	logV, err := note.NewVerifier(vkey)
-	if err != nil {
-		t.Fatalf("log verifier: %v", err)
-	}
-
-	n, err := note.Open(req.Signed, note.VerifierList(logV))
-	if err != nil {
-		t.Fatalf("open checkpoint: %v", err)
-	}
-
-	foreign, err := note.Sign(&note.Note{Text: n.Text}, other)
-	if err != nil {
-		t.Fatalf("sign: %v", err)
-	}
-
-	foreignLine := foreign[len(n.Text)+1:]
 
 	tests := []struct {
 		name        string
@@ -612,13 +598,27 @@ func TestAddCheckpointAnswers(t *testing.T) {
 		wantSize    int64 // > 0 -> want a *ConflictError with this size
 		wantErr     string
 	}{
-		{"409 with size type", http.StatusConflict, "text/x.tlog.size", []byte("7\n"), 7, ""},
-		{"409 with plain type", http.StatusConflict, "text/plain", []byte("12"), 12, ""},
+		{
+			"409 with size type",
+			http.StatusConflict,
+			"text/x.tlog.size",
+			[]byte("7\n"),
+			7,
+			"witness: w1: conflict: witness has size 7",
+		},
+		{
+			"409 with plain type",
+			http.StatusConflict,
+			"text/plain",
+			[]byte("12"),
+			12,
+			"witness: w1: conflict: witness has size 12",
+		},
 		{"409 without a number", http.StatusConflict, "text/plain", []byte("conflict"), 0, "409 without a size"},
+		{"404", http.StatusNotFound, "text/plain", []byte("unknown log"), 0, "witness: w1: unknown log"},
+		{"403", http.StatusForbidden, "text/plain", []byte("bad signature"), 0, "witness: w1: bad log signature"},
+		{"422", http.StatusUnprocessableEntity, "text/plain", []byte("bad proof"), 0, "witness: w1: inconsistent tree"},
 		{"400", http.StatusBadRequest, "text/plain", []byte("old size above checkpoint size"), 0, "status 400"},
-		{"200 empty", http.StatusOK, "text/plain", nil, 0, "bad cosignature"},
-		{"200 signed by another key", http.StatusOK, "text/plain", foreignLine, 0, "bad cosignature"},
-		{"200 garbage", http.StatusOK, "text/plain", []byte("not a signature\n"), 0, "bad cosignature"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -644,6 +644,14 @@ func TestAddCheckpointAnswers(t *testing.T) {
 				t.Fatalf("got no error, want one")
 			}
 
+			if !strings.Contains(err.Error(), tt.wantErr) || !strings.HasPrefix(err.Error(), "witness: w1: ") {
+				t.Errorf("got %q, want %q prefixed with the witness name", err, tt.wantErr)
+			}
+
+			if n := strings.Count(err.Error(), "witness: "); n != 1 {
+				t.Errorf("error %q: got the prefix %d times, want once", err, n)
+			}
+
 			var conflict *ConflictError
 			if tt.wantSize > 0 {
 				if !errors.As(err, &conflict) || conflict.Size != tt.wantSize {
@@ -656,10 +664,103 @@ func TestAddCheckpointAnswers(t *testing.T) {
 			if errors.As(err, &conflict) {
 				t.Errorf("got %v, want no conflict", err)
 			}
+		})
+	}
+}
 
-			if !strings.Contains(err.Error(), tt.wantErr) || !strings.HasPrefix(err.Error(), "witness: w1: ") {
-				t.Errorf("got %q, want %q prefixed with the witness name", err, tt.wantErr)
+func sigLine(t *testing.T, s note.Signer, text string) string {
+	t.Helper()
+
+	signed, err := note.Sign(&note.Note{Text: text}, s)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+
+	return strings.TrimSuffix(string(signed[len(text)+1:]), "\n")
+}
+
+func TestAddCheckpointCosigLines(t *testing.T) {
+	signer, vkey := newLogKey(t)
+	l := newTestLog(t, signer, vkey, 2, "a")
+	req := l.request(t, 0, 2)
+	split := bytes.LastIndex(req.Signed, []byte("\n\n"))
+	body := string(req.Signed[:split+1])
+	logLine := strings.TrimSuffix(string(req.Signed[split+2:]), "\n")
+	otherReq := l.request(t, 0, 1)
+	otherBody := string(otherReq.Signed[:bytes.LastIndex(otherReq.Signed, []byte("\n\n"))+1])
+
+	ws, wv := newCosigKey(t, "w1")
+	sameName, _ := newCosigKey(t, "w1")
+	w2, _ := newCosigKey(t, "w2")
+	w3, _ := newCosigKey(t, "w3")
+	valid := sigLine(t, ws, body)
+	// a real w1 signature over what note.Open would see if the answer started
+	// with a blank line: body, blank line, log signature line
+	shifted := sigLine(t, ws, body+"\n"+logLine+"\n")
+
+	tests := []struct {
+		name     string
+		answer   string
+		wantLine string // "" -> want an error with wantErr
+		wantErr  string
+	}{
+		{"one valid line", valid + "\n", valid, ""},
+		{"other key of the same name, then valid", sigLine(t, sameName, body) + "\n" + valid + "\n", valid, ""},
+		{"valid, then another name", valid + "\n" + sigLine(t, w2, body) + "\n", valid, ""},
+		{"blank line moves the split", "\n" + shifted + "\n", "", "bad cosignature"},
+		{"split-moving signature alone", shifted + "\n", "", "bad cosignature"},
+		{"blank line before valid", "\n" + valid + "\n", "", "bad cosignature"},
+		{"blank line after valid", valid + "\n\n", "", "bad cosignature"},
+		{"junk before valid", "not a signature\n" + valid + "\n", "", "bad cosignature"},
+		{"junk after valid", valid + "\nnot a signature\n", "", "bad cosignature"},
+		{"carriage return", valid + "\r\n", "", "bad cosignature"},
+		{"no final newline", valid, "", "bad cosignature"},
+		{"empty", "", "", "bad cosignature"},
+		{"cosignature over another checkpoint", sigLine(t, ws, otherBody) + "\n", "", "bad cosignature"},
+		{"valid, then a bad w1 signature", valid + "\n" + sigLine(t, ws, otherBody) + "\n", "", "bad cosignature"},
+		{"only other names", sigLine(t, w2, body) + "\n" + sigLine(t, w3, body) + "\n", "", "no cosignature from w1"},
+		{"only another key of the same name", sigLine(t, sameName, body) + "\n", "", "no cosignature from w1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				rw.Header().Set("Content-Type", "text/plain")
+				_, _ = io.WriteString(rw, tt.answer)
+			}))
+			defer srv.Close()
+
+			w := Witness{Name: "w1", URL: srv.URL, Verifier: wv}
+			since := time.Now()
+
+			cosig, err := (&Client{}).AddCheckpoint(t.Context(), w, 0, nil, req.Signed)
+
+			if tt.wantLine == "" {
+				if err == nil {
+					t.Fatalf("got cosignature %q, want an error", cosig.Line)
+				}
+
+				if !strings.Contains(err.Error(), tt.wantErr) || !strings.HasPrefix(err.Error(), "witness: w1: ") {
+					t.Errorf("got %q, want %q prefixed with the witness name", err, tt.wantErr)
+				}
+
+				return
 			}
+
+			if err != nil {
+				t.Fatalf("got %v, want a cosignature", err)
+			}
+
+			if cosig.Line != tt.wantLine {
+				t.Errorf("cosig line: got %q, want %q", cosig.Line, tt.wantLine)
+			}
+
+			if cosig.Time.Location() != time.UTC {
+				t.Errorf("cosig time zone: got %v, want UTC", cosig.Time.Location())
+			}
+
+			checkCosig(t, w, req.Signed, &cosig, since)
 		})
 	}
 }

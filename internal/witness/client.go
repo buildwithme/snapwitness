@@ -62,11 +62,25 @@ func (c *Client) AddCheckpoint(
 ) (wlog.Cosig, error) {
 	cosig, err := c.addCheckpoint(ctx, w, oldSize, proof, signed)
 	if err != nil {
-		return wlog.Cosig{}, fmt.Errorf("witness: %s: %w", w.Name, err)
+		return wlog.Cosig{}, &namedError{name: w.Name, err: err}
 	}
 
 	return cosig, nil
 }
+
+// namedError puts the witness name in front of err. The sentinels and
+// ConflictError already start with "witness: ", and we don't want that
+// twice.
+type namedError struct {
+	name string
+	err  error
+}
+
+func (e *namedError) Error() string {
+	return "witness: " + e.name + ": " + strings.TrimPrefix(e.err.Error(), "witness: ")
+}
+
+func (e *namedError) Unwrap() error { return e.err }
 
 // maxAnswer caps how many bytes of a witness answer are read.
 const maxAnswer = 64 << 10
@@ -143,19 +157,51 @@ func (c *Client) addCheckpoint(
 	}
 }
 
-// openCosig checks the signature lines of a 200 answer against the
-// checkpoint body and returns the one made by w. note.Open only knows the
-// witness key here. It skips the log signature in signed without checking
-// it.
+// openCosig returns w's cosignature from a 200 answer. The answer may only
+// hold note signature lines, and we verify each one on its own over the
+// checkpoint body. Appending the answer to signed would let a blank line in
+// it move the text/signature split.
 func openCosig(w Witness, signed, answer []byte) (wlog.Cosig, error) {
-	n, err := note.Open(append(bytes.Clone(signed), answer...), note.VerifierList(w.Verifier))
-	if err != nil {
-		return wlog.Cosig{}, fmt.Errorf("bad cosignature: %w", err)
+	split := bytes.LastIndex(signed, []byte("\n\n"))
+	if split < 0 {
+		return wlog.Cosig{}, errors.New("checkpoint has no signature block")
 	}
 
-	for _, s := range n.Sigs {
-		if s.Name != w.Name || s.Hash != w.Verifier.KeyHash() {
+	body := signed[:split+1]
+
+	if len(answer) == 0 || answer[len(answer)-1] != '\n' {
+		return wlog.Cosig{}, fmt.Errorf(
+			"bad cosignature: answer %q is empty or does not end in a newline",
+			excerpt(answer),
+		)
+	}
+
+	var cosig *wlog.Cosig
+	// every line: one bad line rejects the whole answer
+	for line := range strings.Lines(string(answer)) {
+		line = strings.TrimSuffix(line, "\n")
+		if !strings.HasPrefix(line, "\u2014 ") {
+			return wlog.Cosig{}, fmt.Errorf("bad cosignature: not a signature line: %q", excerpt([]byte(line)))
+		}
+
+		n, err := note.Open(fmt.Appendf(bytes.Clone(body), "\n%s\n", line), note.VerifierList(w.Verifier))
+
+		if _, ok := errors.AsType[*note.UnverifiedNoteError](err); ok {
+			// Skip a line from another name or key
 			continue
+		}
+
+		if err != nil {
+			return wlog.Cosig{}, fmt.Errorf("bad cosignature: %w", err)
+		}
+
+		s := n.Sigs[0]
+		if n.Text != string(body) || s.Name != w.Name || s.Hash != w.Verifier.KeyHash() {
+			return wlog.Cosig{}, fmt.Errorf(
+				"bad cosignature: line %q does not sign the checkpoint as %s",
+				excerpt([]byte(line)),
+				w.Name,
+			)
 		}
 
 		t, err := fnote.CoSigV1Timestamp(s)
@@ -163,10 +209,16 @@ func openCosig(w Witness, signed, answer []byte) (wlog.Cosig, error) {
 			return wlog.Cosig{}, fmt.Errorf("bad cosignature: %w", err)
 		}
 
-		return wlog.Cosig{Name: s.Name, Time: t.UTC(), Line: "\u2014 " + s.Name + " " + s.Base64}, nil
+		if cosig == nil {
+			cosig = &wlog.Cosig{Name: s.Name, Time: t.UTC(), Line: line}
+		}
 	}
 
-	return wlog.Cosig{}, fmt.Errorf("no cosignature from %s", w.Name)
+	if cosig == nil {
+		return wlog.Cosig{}, fmt.Errorf("no cosignature from %s", w.Name)
+	}
+
+	return *cosig, nil
 }
 
 func excerpt(b []byte) []byte {
