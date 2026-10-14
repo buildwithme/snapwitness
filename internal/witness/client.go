@@ -92,33 +92,17 @@ func (c *Client) addCheckpoint(
 	proof []tlog.Hash,
 	signed []byte,
 ) (wlog.Cosig, error) {
-	var body bytes.Buffer
-	fmt.Fprintf(&body, "old %d\n", oldSize)
-
-	for _, h := range proof {
-		body.WriteString(base64.StdEncoding.EncodeToString(h[:]))
-		body.WriteByte('\n')
-	}
-
-	body.WriteByte('\n')
-	body.Write(signed)
-
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
 		strings.TrimSuffix(w.URL, "/")+"/add-checkpoint",
-		&body,
+		requestBody(oldSize, proof, signed),
 	)
 	if err != nil {
 		return wlog.Cosig{}, err
 	}
 
-	hc := c.HTTP
-	if hc == nil {
-		hc = http.DefaultClient
-	}
-
-	resp, err := hc.Do(req)
+	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return wlog.Cosig{}, err
 	}
@@ -155,6 +139,29 @@ func (c *Client) addCheckpoint(
 	default:
 		return wlog.Cosig{}, fmt.Errorf("status %d: %q", resp.StatusCode, excerpt(answer))
 	}
+}
+
+func requestBody(oldSize int64, proof []tlog.Hash, signed []byte) *bytes.Buffer {
+	var body bytes.Buffer
+	fmt.Fprintf(&body, "old %d\n", oldSize)
+
+	for _, h := range proof {
+		body.WriteString(base64.StdEncoding.EncodeToString(h[:]))
+		body.WriteByte('\n')
+	}
+
+	body.WriteByte('\n')
+	body.Write(signed)
+
+	return &body
+}
+
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+
+	return http.DefaultClient
 }
 
 // openCosig returns w's cosignature from a 200 answer. The answer may only
