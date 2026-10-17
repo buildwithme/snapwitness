@@ -4,13 +4,17 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 	"time"
 
 	"github.com/buildwithme/snapwitness/internal/state"
+	"github.com/buildwithme/snapwitness/internal/witness"
 )
 
 // Severity is how bad a finding is.
@@ -188,6 +192,10 @@ func (r *Report) result() string {
 	return "OK"
 }
 
+func (r *Report) line(label, format string, args ...any) {
+	r.Lines = append(r.Lines, fmt.Sprintf("%-10s ", label)+fmt.Sprintf(format, args...))
+}
+
 func (ws WitnessStatus) describe() string {
 	switch ws.Status {
 	case "cosigned":
@@ -203,6 +211,40 @@ func (ws WitnessStatus) describe() string {
 	}
 
 	return ws.Status + ": " + ws.Error
+}
+
+func statuses(outs []witness.Outcome, size int64) []WitnessStatus {
+	sts := make([]WitnessStatus, len(outs))
+	for i, o := range outs {
+		st := WitnessStatus{Name: o.Witness, Took: o.Took}
+
+		var (
+			conflict *witness.ConflictError
+			urlErr   *url.Error
+		)
+
+		switch {
+		case o.Cosig != nil:
+			st.Status, st.Size, st.Time = "cosigned", size, o.Cosig.Time
+		case errors.As(o.Err, &conflict):
+			st.Status, st.Size = "conflict", conflict.Size
+		case errors.Is(o.Err, context.Canceled):
+			// cut by the quorum stop: quorum met, or out of reach
+			st.Status = "skipped"
+		case errors.Is(o.Err, context.DeadlineExceeded), errors.As(o.Err, &urlErr):
+			st.Status = "unreachable"
+		default:
+			st.Status = "error"
+		}
+
+		if st.Status == "unreachable" || st.Status == "error" {
+			st.Error = o.Err.Error()
+		}
+
+		sts[i] = st
+	}
+
+	return sts
 }
 
 func short(d time.Duration) time.Duration {
