@@ -83,6 +83,8 @@ func newEnv(t *testing.T, n, quorum int) *env {
 
 func (e *env) snapshots() string { return filepath.Join(e.cfg.Repo, "snapshots") }
 
+func (e *env) storage() string { return filepath.Dir(e.cfg.Repo) }
+
 // Snapshots is the keyed view. It lists the snapshot files the way restic
 // snapshots would with the password.
 func (e *env) Snapshots(context.Context) ([]restic.Snapshot, error) {
@@ -151,6 +153,30 @@ func (e *env) backupAndRecord(n int) {
 	}
 }
 
+// save copies the whole storage (repo and log) and returns where the copy
+// is.
+func (e *env) save() string {
+	e.t.Helper()
+	dst := filepath.Join(e.t.TempDir(), "storage")
+	if err := os.CopyFS(dst, os.DirFS(e.storage())); err != nil {
+		e.t.Fatal(err)
+	}
+
+	return dst
+}
+
+func (e *env) restore(saved string) {
+	e.t.Helper()
+
+	if err := os.RemoveAll(e.storage()); err != nil {
+		e.t.Fatal(err)
+	}
+
+	if err := os.CopyFS(e.storage(), os.DirFS(saved)); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
 func (e *env) setDown(down bool) {
 	for _, w := range e.ws {
 		w.SetDown(down)
@@ -185,6 +211,41 @@ func (e *env) wantSizes(step string, logSize, checkpoint int64) {
 
 	if l, c := e.sizes(); l != logSize || c != checkpoint {
 		e.t.Errorf("%s: got log size %d and checkpoint %d, want %d and %d", step, l, c, logSize, checkpoint)
+	}
+}
+
+// signCheckpoint signs the whole log with the log key and stores that
+// checkpoint without cosignatures.
+func (e *env) signCheckpoint() {
+	e.t.Helper()
+
+	key, err := os.ReadFile(e.cfg.KeyFile)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	s, err := note.NewSigner(strings.TrimSpace(string(key)))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	l, err := wlog.Open(e.cfg.LogDir)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	root, err := l.Root(l.Size())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	signed, err := wlog.Sign(wlog.Checkpoint{Origin: e.cfg.Origin, Size: l.Size(), Root: root}, s)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	if err := l.WriteCheckpoint(signed); err != nil {
+		e.t.Fatal(err)
 	}
 }
 
@@ -456,6 +517,121 @@ func TestRecordRefusesRemoved(t *testing.T) {
 	expect(t, "record -accept-removed", e.record(app.RecordOptions{AcceptRemoved: true}), app.ExitOK)
 	e.wantSizes("after the accepted record", 4, 4)
 	expect(t, "audit after the accepted record", e.audit(app.AuditOptions{}), app.ExitOK)
+}
+
+// TestRecordUnwitnessedRemoval: a removal that only sits in the unwitnessed
+// tail still needs -accept-removed on the next record. Anyone with write
+// access to the storage can add such an entry.
+func TestRecordUnwitnessedRemoval(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(3)
+	e.remove(e.ids[0])
+	e.setDown(true)
+	r := e.record(app.RecordOptions{AcceptRemoved: true})
+	// Collect stops at the first failure once the quorum is out of reach
+	expect(t, "record with the witnesses down", r, app.ExitAlarm, "ALARM quorum", "WARN witness")
+	e.wantSizes("after the unwitnessed record", 4, 3)
+
+	e.setDown(false)
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM deleted")
+	e.wantSizes("after the refused record", 4, 3)
+	expect(t, "record -accept-removed", e.record(app.RecordOptions{AcceptRemoved: true}), app.ExitOK)
+	e.wantSizes("after the accepted record", 5, 5)
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitOK)
+}
+
+func TestRollback(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(3)
+	p3 := e.save()
+	e.backupAndRecord(2)
+	e.restore(p3)
+
+	r := e.audit(app.AuditOptions{})
+	expect(t, "audit", r, app.ExitAlarm, "ALARM rollback")
+	f := finding(t, r, "rollback")
+	for _, want := range []string{"w1.test", "w2.test", "size 5", "serves size 3"} {
+		if !strings.Contains(f.Message, want) {
+			t.Errorf("got message %q, want %q in it", f.Message, want)
+		}
+	}
+
+	details := strings.Join(f.Details, "\n")
+	for _, want := range []string{"restored from an older copy", "matches state #3"} {
+		if !strings.Contains(details, want) {
+			t.Errorf("got details %q, want %q in them", details, want)
+		}
+	}
+
+	for _, w := range r.Witnesses {
+		if w.Status != "conflict" || w.Size != 5 {
+			t.Errorf("witness %s: got %s size %d, want conflict size 5", w.Name, w.Status, w.Size)
+		}
+	}
+
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback")
+	e.wantSizes("after the refused record", 3, 3)
+
+	for _, w := range e.ws {
+		if got := w.Size(e.cfg.Origin); got != 5 {
+			t.Errorf("witness %s: got size %d, want 5", w.Name(), got)
+		}
+	}
+}
+
+func TestFork(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(2)
+	p2 := e.save()
+	e.backupAndRecord(1)
+
+	// a different third record on the old copy, witnesses down, then sign it.
+	// Now the log key has signed two histories of size 3
+	e.restore(p2)
+	e.setDown(true)
+	e.backup()
+	e.record(app.RecordOptions{})
+	e.setDown(false)
+	e.signCheckpoint()
+
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM fork", "ALARM stale")
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM fork")
+	e.wantSizes("after the refused record", 3, 3)
+}
+
+func TestQuorumLoss(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(3)
+	e.ws[1].SetDown(true)
+	e.backup()
+
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM quorum", "WARN witness")
+	e.wantSizes("after the record without quorum", 4, 3)
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitOK, "WARN pending", "WARN unrecorded", "WARN witness")
+
+	e.ws[1].SetDown(false)
+	expect(t, "record again", e.record(app.RecordOptions{}), app.ExitOK)
+	e.wantSizes("after the record with quorum", 5, 5)
+	expect(t, "audit again", e.audit(app.AuditOptions{}), app.ExitOK)
+}
+
+func TestQuorumLossOnFirstRecord(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.ws[1].SetDown(true)
+	e.backup()
+
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM quorum", "WARN witness")
+	e.wantSizes("after the first record", 1, 1)
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM stale", "WARN witness")
+
+	e.ws[1].SetDown(false)
+	expect(t, "record again", e.record(app.RecordOptions{}), app.ExitOK)
+	expect(t, "audit again", e.audit(app.AuditOptions{}), app.ExitOK)
 }
 
 type failingSource struct{}
