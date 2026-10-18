@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/mod/sumdb/note"
@@ -255,6 +256,41 @@ func checkFresh(
 			),
 		)
 	}
+}
+
+// AuditAll audits all configs in parallel, each with its own timeout (none
+// if timeout <= 0), and returns the reports in the order of cfgs. A config
+// that timed out gets a report with Err set.
+func AuditAll(
+	ctx context.Context,
+	cfgs []*config.Config,
+	wc *witness.Client,
+	opts AuditOptions,
+	timeout time.Duration,
+) []*Report {
+	reports := make([]*Report, len(cfgs))
+
+	var wg sync.WaitGroup
+
+	for i, cfg := range cfgs {
+		wg.Go(func() {
+			ctx := ctx
+
+			if timeout > 0 {
+				var cancel context.CancelFunc
+
+				ctx, cancel = context.WithTimeout(ctx, timeout)
+
+				defer cancel()
+			}
+
+			reports[i] = Audit(ctx, cfg, wc, opts)
+		})
+	}
+
+	wg.Wait()
+
+	return reports
 }
 
 func trust(cfg *config.Config) (note.Verifier, []note.Verifier, []witness.Witness, error) {

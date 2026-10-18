@@ -680,6 +680,32 @@ func TestRecordErrors(t *testing.T) {
 	})
 }
 
+func TestAuditAll(t *testing.T) {
+	t.Parallel()
+	slow, fast := newEnv(t, 1, 1), newEnv(t, 1, 1)
+	slow.backupAndRecord(1)
+	fast.backupAndRecord(1)
+	slow.ws[0].SetDelay(10 * time.Second)
+
+	start := time.Now()
+	cfgs := []*config.Config{slow.cfg, fast.cfg}
+	reports := app.AuditAll(t.Context(), cfgs, &witness.Client{}, app.AuditOptions{}, 500*time.Millisecond)
+
+	if took := time.Since(start); took > 5*time.Second {
+		t.Errorf("got %s, want the timeout to cut the slow audit", took)
+	}
+
+	if len(reports) != 2 || reports[0].Config != slow.cfg.Path || reports[1].Config != fast.cfg.Path {
+		t.Fatalf("got %d reports, want 2 in the order of the configs", len(reports))
+	}
+
+	if r := reports[0]; r.ExitCode() != app.ExitError || !strings.Contains(r.Err, "deadline") {
+		t.Errorf("slow: got exit %d with error %q, want exit %d after the timeout", r.ExitCode(), r.Err, app.ExitError)
+	}
+
+	expect(t, "fast", reports[1], app.ExitOK)
+}
+
 func TestInit(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
