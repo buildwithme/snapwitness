@@ -33,3 +33,6 @@ go.work.sum
 .vscode/
 *.swp
 .DS_Store
+
+# Built binary
+/snapwitness
