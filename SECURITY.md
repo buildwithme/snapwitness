@@ -12,3 +12,5 @@ I especially want to hear about:
 - a flaw in how the log key or the config is created, stored or read
 
 The attacks in [LIMITATIONS.md](LIMITATIONS.md) are known, for example a snapshot deleted before its first record or witnesses that collude with the storage operator. Problems in restic, litewitness or other tools belong to those projects, please report them there.
+
+The demo script uses a fixed test password on purpose.

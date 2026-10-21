@@ -19,6 +19,16 @@ restic's own design document says it directly: "Restic is not designed to detect
 
 Append-only modes and S3 Object Lock help when the client gets hacked. Against a dishonest storage operator they don't help, and the client gets no proof of anything.
 
+## Quick start
+
+```sh
+make demo
+```
+
+The demo runs five cases against real restic and two real witnesses (litewitness): a clean repository, a deleted snapshot, a prune nobody approved, a known gap and a rollback. You see every command with its output, and at the end a table with the results.
+
+You need Go, `ssh-agent`, `ssh-keygen`, `curl` and restic (from `$RESTIC_BIN` or `PATH`). The script is [demo/demo.sh](demo/demo.sh).
+
 ## Commands
 
 ```text

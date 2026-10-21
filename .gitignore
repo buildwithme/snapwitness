@@ -34,5 +34,7 @@ go.work.sum
 *.swp
 .DS_Store
 
-# Built binary
+# Demo work files and built binary
+demo/.work/
+demo/.bin/
 /snapwitness

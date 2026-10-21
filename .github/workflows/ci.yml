@@ -26,4 +26,18 @@ jobs:
         with:
           go-version-file: go.mod
       - uses: astral-sh/setup-uv@v7
+      # shellcheck comes with the runner image
       - run: make lint
+
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Install restic
+        run: |
+          go install github.com/restic/restic/cmd/restic@v0.19.1
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - run: make demo
