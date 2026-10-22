@@ -1,8 +1,10 @@
 package config
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -115,8 +117,12 @@ func TestSaveRefusesOverwrite(t *testing.T) {
 	}
 
 	err := Save(path, testConfig(t, dir))
-	if !errors.Is(err, ErrExists) {
-		t.Fatalf("got %v, want ErrExists", err)
+	if !errors.Is(err, ErrExists) || !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("got %v, want ErrExists and fs.ErrExist", err)
+	}
+
+	if got, want := err.Error(), "config: file already exists: "+path; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 
 	b, _ := os.ReadFile(path)
@@ -215,6 +221,8 @@ func TestLoadRejects(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("got %v, want error containing %q", err, tt.wantErr)
 			}
+
+			assertOnePrefix(t, err)
 		})
 	}
 
@@ -223,10 +231,38 @@ func TestLoadRejects(t *testing.T) {
 	}
 }
 
+func assertOnePrefix(t *testing.T, err error) {
+	t.Helper()
+
+	if msg := err.Error(); !strings.HasPrefix(msg, "config: ") || strings.Count(msg, "config: ") != 1 {
+		t.Errorf("got %q, want one config: prefix", msg)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	dir := t.TempDir()
 	if err := testConfig(t, dir).Validate(); err != nil {
 		t.Fatalf("valid config: %v", err)
+	}
+
+	// one Ed25519 key under two names, plain and as cosignature/v1
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sameKey := func(name string) string {
+		v, err := note.NewEd25519VerifierKey(name, pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return v
+	}
+
+	cosigSameKey, err := fnote.VKeyToCosignatureV1(sameKey("witness-2.lw.example"))
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	tests := []struct {
@@ -249,6 +285,14 @@ func TestValidate(t *testing.T) {
 			func(c *Config) { c.Witnesses[1].VKey = vkey(t, "witness-1.lw.example") },
 			"duplicate",
 		},
+		{"same key under two names", func(c *Config) {
+			c.Witnesses[0].VKey = sameKey("witness-1.lw.example")
+			c.Witnesses[1].VKey = sameKey("witness-2.lw.example")
+		}, "witness witness-2.lw.example: same key as witness witness-1.lw.example"},
+		{"same key in both vkey forms", func(c *Config) {
+			c.Witnesses[0].VKey = sameKey("witness-1.lw.example")
+			c.Witnesses[1].VKey = cosigSameKey
+		}, "same key as witness"},
 		{"witness url scheme", func(c *Config) { c.Witnesses[0].URL = "ftp://127.0.0.1" }, "url"},
 		{"witness url without host", func(c *Config) { c.Witnesses[0].URL = "http://" }, "url"},
 		{"quorum zero", func(c *Config) { c.Quorum = 0 }, "quorum"},
@@ -264,6 +308,8 @@ func TestValidate(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("got %v, want error containing %q", err, tt.wantErr)
 			}
+
+			assertOnePrefix(t, err)
 		})
 	}
 }

@@ -4,6 +4,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -42,8 +43,9 @@ type Config struct {
 // gets two hours of slack.
 const DefaultMaxAge = 26 * time.Hour
 
-// ErrExists is what Save returns when the file is already there.
-var ErrExists = errors.New("config: file already exists")
+// ErrExists is what Save returns when the file is already there. It wraps
+// fs.ErrExist.
+var ErrExists = fmt.Errorf("config: %w", fs.ErrExist)
 
 // Load reads and validates the config file at path. Relative paths in it
 // resolve against the file's directory.
@@ -64,7 +66,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	c.Path = abs
-	if err := c.Validate(); err != nil {
+	if err := c.validate(); err != nil {
 		return nil, fmt.Errorf("config: %s: %w", path, err)
 	}
 
@@ -153,63 +155,97 @@ func resolve(dir, p string) string {
 // Validate checks the origin, the log key, each witness key and URL, the
 // quorum and the max age.
 func (c *Config) Validate() error {
+	if err := c.validate(); err != nil {
+		return fmt.Errorf("config: %w", err)
+	}
+
+	return nil
+}
+
+// validate is Validate without the package prefix. Load puts the file name
+// there instead.
+func (c *Config) validate() error {
 	if c.Origin == "" || strings.ContainsAny(c.Origin, " +") {
-		return fmt.Errorf("config: origin %q: want no spaces or +", c.Origin)
+		return fmt.Errorf("origin %q: want no spaces or +", c.Origin)
 	}
 
 	for _, p := range []struct{ name, path string }{{"repo", c.Repo}, {"logdir", c.LogDir}} {
 		if !filepath.IsAbs(p.path) {
-			return fmt.Errorf("config: %s %q: want an absolute path", p.name, p.path)
+			return fmt.Errorf("%s %q: want an absolute path", p.name, p.path)
 		}
 	}
 
 	if c.KeyFile != "" && !filepath.IsAbs(c.KeyFile) {
-		return fmt.Errorf("config: keyfile %q: want an absolute path", c.KeyFile)
+		return fmt.Errorf("keyfile %q: want an absolute path", c.KeyFile)
 	}
 
-	v, err := c.LogVerifier()
+	v, err := note.NewVerifier(c.LogKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("logkey: %w", err)
 	}
 
 	if v.Name() != c.Origin {
-		return fmt.Errorf("config: logkey name %q, want origin %q", v.Name(), c.Origin)
+		return fmt.Errorf("logkey name %q, want origin %q", v.Name(), c.Origin)
 	}
 
 	if len(c.Witnesses) == 0 {
-		return fmt.Errorf("config: no witness")
-	}
-
-	vs, err := c.WitnessVerifiers()
-	if err != nil {
-		return err
+		return errors.New("no witness")
 	}
 
 	names := map[string]bool{}
+	keys := map[string]string{} // public key -> witness name
 
-	for i, w := range c.Witnesses {
-		name := vs[i].Name()
+	for _, w := range c.Witnesses {
+		wv, err := fnote.NewVerifierForCosignatureV1(w.VKey)
+		if err != nil {
+			return fmt.Errorf("witness %s: %w", w.Name, err)
+		}
+
+		name := wv.Name()
 		if names[name] {
-			return fmt.Errorf("config: witness %s: duplicate name", name)
+			return fmt.Errorf("witness %s: duplicate name", name)
 		}
 
 		names[name] = true
+		// the same key under two names would count twice toward the
+		// quorum, since a cosignature doesn't cover the witness name
+		key := publicKey(w.VKey)
+		if other, ok := keys[key]; ok {
+			return fmt.Errorf("witness %s: same key as witness %s", name, other)
+		}
+
+		keys[key] = name
 
 		u, err := url.Parse(w.URL)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return fmt.Errorf("config: witness %s: url %q: want http or https", name, w.URL)
+			return fmt.Errorf("witness %s: url %q: want http or https", name, w.URL)
 		}
 	}
 
 	if c.Quorum < 1 || c.Quorum > len(c.Witnesses) {
-		return fmt.Errorf("config: quorum %d: want 1..%d", c.Quorum, len(c.Witnesses))
+		return fmt.Errorf("quorum %d: want 1..%d", c.Quorum, len(c.Witnesses))
 	}
 
 	if c.MaxAge <= 0 {
-		return fmt.Errorf("config: maxage %v: want more than 0", c.MaxAge)
+		return fmt.Errorf("maxage %v: want more than 0", c.MaxAge)
 	}
 
 	return nil
+}
+
+// publicKey returns the raw key of a vkey, without the algorithm byte. That
+// makes a plain Ed25519 vkey equal to its cosignature/v1 form.
+func publicKey(vkey string) string {
+	// Skip the name and the key hash; the base64 key may itself contain a +
+	_, rest, _ := strings.Cut(vkey, "+")
+	_, enc, _ := strings.Cut(rest, "+")
+
+	b, err := base64.StdEncoding.DecodeString(enc)
+	if err != nil || len(b) == 0 {
+		return vkey
+	}
+
+	return string(b[1:])
 }
 
 // Marshal returns the config as text, one directive per line, always in the
@@ -271,7 +307,7 @@ func Save(path string, c *Config) error {
 	//nolint:gosec // public keys and paths only; the auditor may read it as another user
 	f, err := os.OpenFile(abs, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if errors.Is(err, fs.ErrExist) {
-		return fmt.Errorf("config: save %s: %w", path, ErrExists)
+		return fmt.Errorf("%w: %s", ErrExists, path)
 	}
 
 	if err != nil {
