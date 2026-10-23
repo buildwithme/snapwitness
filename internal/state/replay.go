@@ -115,9 +115,9 @@ func Replay(entries [][]byte) (*State, error) {
 	var cur []string
 
 	for i, e := range entries {
-		r, err := Parse(e)
+		r, err := parse(e)
 		if err != nil {
-			return nil, fmt.Errorf("state: entry %d: %w", i, err)
+			return nil, fmt.Errorf("state: entry %d: parse: %w", i, err)
 		}
 
 		if cur, err = s.apply(int64(i), r, cur); err != nil {

@@ -116,8 +116,13 @@ func TestParseRejects(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if r, err := Parse([]byte(tt.in)); err == nil {
+			r, err := Parse([]byte(tt.in))
+			if err == nil {
 				t.Fatalf("got %+v, want error", r)
+			}
+
+			if msg := err.Error(); !strings.HasPrefix(msg, "state: parse: ") || strings.Count(msg, "state: ") != 1 {
+				t.Errorf("got %q, want one state: prefix", msg)
 			}
 		})
 	}
@@ -260,7 +265,7 @@ func TestReplayErrors(t *testing.T) {
 		second  []byte
 		wantErr string
 	}{
-		{"parse error", []byte("garbage\n"), "entry 1"},
+		{"parse error", []byte("garbage\n"), "state: entry 1: parse: 1 lines, want at least 5"},
 		{"add known id", rec(one, []string{a}, nil).Marshal(), "record 1: adds known id"},
 		{"remove unknown id", rec(one, nil, []string{b}).Marshal(), "record 1: removes unknown id"},
 		{"count mismatch", badCount.Marshal(), "record 1: set has 2 ids, record says 3"},
@@ -271,6 +276,10 @@ func TestReplayErrors(t *testing.T) {
 			_, err := Replay([][]byte{r0.Marshal(), tt.second, r0.Marshal()})
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("got %v, want error containing %q", err, tt.wantErr)
+			}
+
+			if msg := err.Error(); !strings.HasPrefix(msg, "state: ") || strings.Count(msg, "state: ") != 1 {
+				t.Errorf("got %q, want one state: prefix", msg)
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -55,32 +56,43 @@ func (r *Record) Marshal() []byte {
 // Parse reads a record and rejects anything Marshal wouldn't produce. Every
 // record has exactly one valid encoding, and Parse(r.Marshal()) round-trips.
 func Parse(b []byte) (*Record, error) {
+	r, err := parse(b)
+	if err != nil {
+		return nil, fmt.Errorf("state: parse: %w", err)
+	}
+
+	return r, nil
+}
+
+// parse is Parse without the package prefix on its errors. Replay names the
+// entry there instead.
+func parse(b []byte) (*Record, error) {
 	if !utf8.Valid(b) {
-		return nil, fmt.Errorf("state: parse: invalid utf-8")
+		return nil, errors.New("invalid utf-8")
 	}
 
 	s := string(b)
 	if !strings.HasSuffix(s, "\n") {
-		return nil, fmt.Errorf("state: parse: missing final newline")
+		return nil, errors.New("missing final newline")
 	}
 
 	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 	for i, l := range lines {
 		if l == "" {
-			return nil, fmt.Errorf("state: parse: line %d: empty line", i+1)
+			return nil, fmt.Errorf("line %d: empty line", i+1)
 		}
 
 		if strings.HasSuffix(l, " ") {
-			return nil, fmt.Errorf("state: parse: line %d: trailing space", i+1)
+			return nil, fmt.Errorf("line %d: trailing space", i+1)
 		}
 	}
 
 	if len(lines) < 5 {
-		return nil, fmt.Errorf("state: parse: %d lines, want at least 5", len(lines))
+		return nil, fmt.Errorf("%d lines, want at least 5", len(lines))
 	}
 
 	if lines[0] != Header {
-		return nil, fmt.Errorf("state: parse: line 1: got header %q, want %q", lines[0], Header)
+		return nil, fmt.Errorf("line 1: got header %q, want %q", lines[0], Header)
 	}
 
 	var r Record
@@ -92,7 +104,7 @@ func Parse(b []byte) (*Record, error) {
 
 	t, err := time.Parse(TimeFormat, v)
 	if err != nil || t.Format(TimeFormat) != v {
-		return nil, fmt.Errorf("state: parse: line 2: bad time %q", v)
+		return nil, fmt.Errorf("line 2: bad time %q", v)
 	}
 
 	r.Time = t
@@ -102,7 +114,7 @@ func Parse(b []byte) (*Record, error) {
 	}
 
 	if !validTool(r.Tool) {
-		return nil, fmt.Errorf("state: parse: line 3: bad tool %q", r.Tool)
+		return nil, fmt.Errorf("line 3: bad tool %q", r.Tool)
 	}
 
 	if v, err = field(lines, 3, "count"); err != nil {
@@ -111,7 +123,7 @@ func Parse(b []byte) (*Record, error) {
 
 	// check the round trip too: "+4", "04" and other spellings of 4 must fail
 	if r.Count, err = strconv.Atoi(v); err != nil || r.Count < 0 || strconv.Itoa(r.Count) != v {
-		return nil, fmt.Errorf("state: parse: line 4: bad count %q", v)
+		return nil, fmt.Errorf("line 4: bad count %q", v)
 	}
 
 	if v, err = field(lines, 4, "set"); err != nil {
@@ -119,11 +131,11 @@ func Parse(b []byte) (*Record, error) {
 	}
 
 	if !ValidID(v) {
-		return nil, fmt.Errorf("state: parse: line 5: bad set hash %q", v)
+		return nil, fmt.Errorf("line 5: bad set hash %q", v)
 	}
 
 	if _, err := hex.Decode(r.Set[:], []byte(v)); err != nil {
-		return nil, fmt.Errorf("state: parse: line 5: %w", err)
+		return nil, fmt.Errorf("line 5: %w", err)
 	}
 
 	rest := lines[5:]
@@ -138,7 +150,7 @@ func Parse(b []byte) (*Record, error) {
 	}
 
 	if len(rest) > 0 {
-		return nil, fmt.Errorf("state: parse: line %d: unexpected %q", len(lines)-len(rest)+1, rest[0])
+		return nil, fmt.Errorf("line %d: unexpected %q", len(lines)-len(rest)+1, rest[0])
 	}
 
 	if err := checkIDs("added", r.Added); err != nil {
@@ -151,7 +163,7 @@ func Parse(b []byte) (*Record, error) {
 
 	for _, id := range r.Added {
 		if _, ok := slices.BinarySearch(r.Removed, id); ok {
-			return nil, fmt.Errorf("state: parse: id %s both added and removed", id)
+			return nil, fmt.Errorf("id %s both added and removed", id)
 		}
 	}
 
@@ -162,7 +174,7 @@ func Parse(b []byte) (*Record, error) {
 func field(lines []string, i int, key string) (string, error) {
 	v, ok := strings.CutPrefix(lines[i], key+" ")
 	if !ok || v == "" {
-		return "", fmt.Errorf("state: parse: line %d: got %q, want %s", i+1, lines[i], key)
+		return "", fmt.Errorf("line %d: got %q, want %s", i+1, lines[i], key)
 	}
 
 	return v, nil
@@ -187,11 +199,11 @@ func validTool(s string) bool {
 func checkIDs(what string, ids []string) error {
 	for i, id := range ids {
 		if !ValidID(id) {
-			return fmt.Errorf("state: parse: %s: bad id %q", what, id)
+			return fmt.Errorf("%s: bad id %q", what, id)
 		}
 
 		if i > 0 && ids[i-1] >= id {
-			return fmt.Errorf("state: parse: %s: %s out of order or duplicate", what, id)
+			return fmt.Errorf("%s: %s out of order or duplicate", what, id)
 		}
 	}
 
