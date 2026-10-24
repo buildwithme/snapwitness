@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -502,6 +503,62 @@ func TestCollectStopAt(t *testing.T) {
 				t.Errorf("slow witness request was not canceled")
 			}
 		})
+	}
+}
+
+// lingerTransport holds the request to host until its context ends and then
+// waits 200ms more, like a connection that's slow to close. Requests to other
+// hosts wait until the one to host has arrived.
+type lingerTransport struct {
+	host    string
+	arrived chan struct{}
+	done    atomic.Bool
+}
+
+func (lt *lingerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.URL.Host != lt.host {
+		select {
+		case <-lt.arrived:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+
+		return http.DefaultTransport.RoundTrip(r)
+	}
+
+	if r.Body != nil {
+		_ = r.Body.Close()
+	}
+
+	close(lt.arrived)
+	<-r.Context().Done()
+	time.Sleep(200 * time.Millisecond)
+	lt.done.Store(true)
+
+	return nil, r.Context().Err()
+}
+
+func TestCollectWaitsForCut(t *testing.T) {
+	signer, vkey := newLogKey(t)
+	l := newTestLog(t, signer, vkey, 4, "a")
+	_, quick := newWitness(t, "quick", l)
+	_, v := newCosigKey(t, "stuck")
+	stuck := Witness{Name: "stuck", URL: "http://stuck.test", Verifier: v}
+	lt := &lingerTransport{host: "stuck.test", arrived: make(chan struct{})}
+	c := &Client{HTTP: &http.Client{Transport: lt}}
+
+	outs := c.Collect(t.Context(), []Witness{stuck, quick}, l.request(t, 0, 4), 1)
+
+	if !lt.done.Load() {
+		t.Error("Collect returned before the goroutine of the cut witness finished")
+	}
+
+	if outs[0].Witness != "stuck" || !errors.Is(outs[0].Err, context.Canceled) {
+		t.Errorf("stuck outcome: got %s %v, want stuck and context.Canceled", outs[0].Witness, outs[0].Err)
+	}
+
+	if outs[1].Witness != "quick" || outs[1].Cosig == nil {
+		t.Errorf("quick outcome: got %s %v, want quick with a cosignature", outs[1].Witness, outs[1].Err)
 	}
 }
 

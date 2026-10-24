@@ -29,8 +29,9 @@ type Outcome struct {
 
 // Collect asks all witnesses in ws in parallel and returns the outcomes in
 // the order of ws. With stopAt > 0 it returns as soon as stopAt witnesses
-// have cosigned or that can't happen anymore, and cancels the rest. With
-// stopAt == 0 it waits for every answer, or for ctx.
+// have cosigned or that can't happen anymore. With stopAt == 0 it waits for
+// every answer, or for ctx. A witness that got cut off has a context error.
+// No goroutine is left running when Collect returns.
 func (c *Client) Collect(ctx context.Context, ws []Witness, req Request, stopAt int) []Outcome {
 	start := time.Now()
 	ctx, cancel := context.WithCancel(ctx)
@@ -41,8 +42,7 @@ func (c *Client) Collect(ctx context.Context, ws []Witness, req Request, stopAt 
 		i   int
 		out Outcome
 	}
-	// one slot per witness. A late answer can't block once Collect has
-	// returned
+	// one slot per witness, no sender ever blocks
 	answers := make(chan answer, len(ws))
 	for i, w := range ws {
 		go func() {
@@ -87,6 +87,12 @@ wait:
 		if !answered[i] {
 			outs[i] = Outcome{Witness: w.Name, Err: fmt.Errorf("witness: %s: %w", w.Name, why), Took: time.Since(start)}
 		}
+	}
+
+	cancel()
+
+	for range pending {
+		<-answers
 	}
 
 	return outs
