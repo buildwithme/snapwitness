@@ -330,7 +330,11 @@ func TestVerifyRejects(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Verify(tt.signed, v, []note.Verifier{wv})
 			if err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Errorf("got %v, want an error with %q", err, tt.want)
+				t.Fatalf("got %v, want an error with %q", err, tt.want)
+			}
+
+			if msg := err.Error(); !strings.HasPrefix(msg, "wlog: ") || strings.Count(msg, "wlog: ") != 1 {
+				t.Errorf("got %q, want one wlog: prefix", msg)
 			}
 		})
 	}

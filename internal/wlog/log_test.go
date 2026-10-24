@@ -11,10 +11,11 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/mod/sumdb/tlog"
 )
@@ -203,18 +204,131 @@ func TestOpenRejectsBadFrames(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsDevice(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("no /dev/null")
+func TestReadRejectsOtherFiles(t *testing.T) {
+	// Each helper puts something other than a regular file at name in dir
+	symlink := func(t *testing.T, dir, name string) {
+		t.Helper()
+		target := filepath.Join(t.TempDir(), "target")
+		if err := os.WriteFile(target, encodeFrame([]byte("elsewhere")), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Symlink(target, filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dangling := func(t *testing.T, dir, name string) {
+		t.Helper()
+
+		if err := os.Symlink(filepath.Join(dir, "missing"), filepath.Join(dir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fifo := func(t *testing.T, dir, name string) {
+		t.Helper()
+
+		if err := syscall.Mkfifo(filepath.Join(dir, name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name  string
+		file  string
+		setup func(t *testing.T, dir, name string)
+		want  string
+	}{
+		{"symlinked entries", EntriesFile, symlink, ""},
+		{"dangling entries symlink", EntriesFile, dangling, ""},
+		{"fifo entries", EntriesFile, fifo, "not a regular file"},
+		{"symlinked checkpoint", CheckpointFile, symlink, ""},
+		{"dangling checkpoint symlink", CheckpointFile, dangling, ""},
+		{"fifo checkpoint", CheckpointFile, fifo, "not a regular file"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tt.file == CheckpointFile {
+				dir = newLog(t, []byte("entry")).Dir()
+			}
+
+			tt.setup(t, dir, tt.file)
+			// read in a goroutine. If the open on the fifo blocks, the test
+			// fails and doesn't hang
+			done := make(chan error, 1)
+
+			go func() {
+				if tt.file == EntriesFile {
+					_, err := Open(dir)
+					done <- err
+
+					return
+				}
+
+				l, err := Open(dir)
+				if err == nil {
+					_, err = l.ReadCheckpoint()
+				}
+
+				done <- err
+			}()
+
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("read blocked, want an error")
+			}
+
+			if err == nil || errors.Is(err, ErrNoLog) || errors.Is(err, ErrNoCheckpoint) {
+				t.Fatalf("got %v, want a read error", err)
+			}
+
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("got %v, want an error with %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadRejectsOverCap(t *testing.T) {
+	// sparse file, the test shouldn't write 256 MiB
+	sized := func(t *testing.T, path string, size int64) {
+		t.Helper()
+
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := f.Truncate(size); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	dir := t.TempDir()
-	if err := os.Symlink("/dev/null", filepath.Join(dir, EntriesFile)); err != nil {
-		t.Fatal(err)
+	sized(t, filepath.Join(dir, EntriesFile), maxEntriesSize+1)
+
+	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "over 268435456 bytes") {
+		t.Errorf("entries over the cap: got %v, want an over error", err)
 	}
 
-	if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "not a regular file") {
-		t.Errorf("got %v, want a not a regular file error", err)
+	l := newLog(t)
+	path := filepath.Join(l.Dir(), CheckpointFile)
+	sized(t, path, maxCheckpointSize)
+
+	if b, err := l.ReadCheckpoint(); err != nil || len(b) != maxCheckpointSize {
+		t.Errorf("checkpoint at the cap: got %d bytes and %v, want %d bytes", len(b), err, maxCheckpointSize)
+	}
+
+	sized(t, path, maxCheckpointSize+1)
+
+	if _, err := l.ReadCheckpoint(); err == nil || !strings.Contains(err.Error(), "over 1048576 bytes") {
+		t.Errorf("checkpoint over the cap: got %v, want an over error", err)
 	}
 }
 

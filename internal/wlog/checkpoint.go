@@ -109,7 +109,7 @@ func Verify(signed []byte, logKey note.Verifier, witnesses []note.Verifier) (*Ve
 
 	c, err := ParseCheckpoint([]byte(n.Text))
 	if err != nil {
-		return nil, fmt.Errorf("wlog: verify: %w", err)
+		return nil, err
 	}
 
 	if c.Origin != logKey.Name() {
@@ -117,7 +117,7 @@ func Verify(signed []byte, logKey note.Verifier, witnesses []note.Verifier) (*Ve
 	}
 
 	v := &Verified{Checkpoint: c}
-	// n.Sigs holds only the signatures note.Open verified, at most one per key
+	// Walk only the signatures note.Open verified, at most one per key
 	for _, s := range n.Sigs {
 		line := sigPrefix + s.Name + " " + s.Base64
 		if s.Name == logKey.Name() && s.Hash == logKey.KeyHash() {

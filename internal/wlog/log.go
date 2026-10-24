@@ -9,6 +9,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -29,6 +30,10 @@ const (
 	frameHeader = 4
 	// maxCheckpointSize bounds the checkpoint read back from the storage.
 	maxCheckpointSize = 1 << 20
+	// maxEntriesSize bounds the entries file, since Open keeps the whole log in
+	// memory. With records of a few KiB, 256 MiB is years of daily backups.
+	// TODO: stream the entries once logs get anywhere near that
+	maxEntriesSize = 256 << 20
 )
 
 var (
@@ -55,7 +60,7 @@ func Create(dir string) error {
 		return fmt.Errorf("wlog: create: %w", err)
 	}
 
-	//nolint:gosec // the log is public, the auditor may read it as another user
+	//nolint:gosec // the auditor may read the log as another user
 	f, err := os.OpenFile(filepath.Join(dir, EntriesFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("wlog: create: %w", err)
@@ -74,9 +79,9 @@ func Create(dir string) error {
 
 // Open reads every entry in dir and recomputes the RFC 6962 hashes in
 // memory. We never take a hash from the storage. ErrNoLog means the entries
-// file is missing; a torn or oversized frame is an error too.
+// file is missing.
 func Open(dir string) (*Log, error) {
-	data, err := readRegular(filepath.Join(dir, EntriesFile), 0)
+	data, err := readFile(filepath.Join(dir, EntriesFile), maxEntriesSize)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNoLog
 	}
@@ -205,9 +210,11 @@ func (l *Log) Consistency(from, to int64) ([]tlog.Hash, error) {
 	return p, nil
 }
 
-// ReadCheckpoint returns the stored signed checkpoint note, or ErrNoCheckpoint.
+// ReadCheckpoint returns the stored signed checkpoint note, or
+// ErrNoCheckpoint. A checkpoint over 1 MiB or one that isn't a regular file
+// is an error.
 func (l *Log) ReadCheckpoint() ([]byte, error) {
-	b, err := readRegular(filepath.Join(l.dir, CheckpointFile), maxCheckpointSize)
+	b, err := readFile(filepath.Join(l.dir, CheckpointFile), maxCheckpointSize)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNoCheckpoint
 	}
@@ -301,11 +308,18 @@ func appendFrame(path string, frame []byte) error {
 	return err
 }
 
-// readRegular reads a whole file, but only a regular one. A pipe or a device
-// in its place could hang or flood the reader. With a limit above 0, larger
-// files fail too.
-func readRegular(path string, limit int64) ([]byte, error) {
-	st, err := os.Stat(path)
+// readFile reads a regular file of at most limit bytes through one handle.
+// It never follows a symlink or blocks on a fifo. All checks run on the
+// handle: the storage can't swap the file between check and read.
+func readFile(path string, limit int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() { _ = f.Close() }()
+
+	st, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -314,11 +328,21 @@ func readRegular(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
 
-	if limit > 0 && st.Size() > limit {
+	if st.Size() > limit {
 		return nil, fmt.Errorf("%s is over %d bytes", path, limit)
 	}
 
-	return os.ReadFile(path)
+	// Read one byte past the limit to catch a file that grew after the Stat
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%s is over %d bytes", path, limit)
+	}
+
+	return b, nil
 }
 
 // syncDir flushes the directory itself. Without it a new or renamed file
