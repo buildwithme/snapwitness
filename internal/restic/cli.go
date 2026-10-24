@@ -47,6 +47,9 @@ func (c *CLI) Snapshots(ctx context.Context) ([]Snapshot, error) {
 	//nolint:gosec // G204: bin and repo are the user's own config, passed as separate args
 	cmd := exec.CommandContext(ctx, bin, "-r", c.Repo, "snapshots", "--json", "--no-lock")
 	cmd.Env = append(os.Environ(), c.Env...)
+	// after a cancel kills restic a child may still hold the pipes open. Stop
+	// waiting for them 5s later
+	cmd.WaitDelay = 5 * time.Second
 
 	var stdout, stderr bytes.Buffer
 
@@ -54,6 +57,10 @@ func (c *CLI) Snapshots(ctx context.Context) ([]Snapshot, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("restic: snapshots: %w", ctxErr)
+		}
+
 		tail := stderr.Bytes()
 		if len(tail) > stderrTail {
 			tail = tail[len(tail)-stderrTail:]
@@ -62,7 +69,7 @@ func (c *CLI) Snapshots(ctx context.Context) ([]Snapshot, error) {
 		msg := strings.TrimSpace(string(tail))
 
 		if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
-			return nil, fmt.Errorf("restic: snapshots: exit code %d: %s", exitErr.ExitCode(), msg)
+			return nil, fmt.Errorf("restic: snapshots: exit code %d: %q", exitErr.ExitCode(), msg)
 		}
 
 		return nil, fmt.Errorf("restic: snapshots: %w", err)
