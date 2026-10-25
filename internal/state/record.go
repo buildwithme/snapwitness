@@ -139,15 +139,8 @@ func parse(b []byte) (*Record, error) {
 	}
 
 	rest := lines[5:]
-	for len(rest) > 0 && strings.HasPrefix(rest[0], "+ ") {
-		r.Added = append(r.Added, rest[0][2:])
-		rest = rest[1:]
-	}
-
-	for len(rest) > 0 && strings.HasPrefix(rest[0], "- ") {
-		r.Removed = append(r.Removed, rest[0][2:])
-		rest = rest[1:]
-	}
+	r.Added, rest = takeIDs(rest, "+ ")
+	r.Removed, rest = takeIDs(rest, "- ")
 
 	if len(rest) > 0 {
 		return nil, fmt.Errorf("line %d: unexpected %q", len(lines)-len(rest)+1, rest[0])
@@ -178,6 +171,20 @@ func field(lines []string, i int, key string) (string, error) {
 	}
 
 	return v, nil
+}
+
+func takeIDs(lines []string, prefix string) (ids, rest []string) {
+	for len(lines) > 0 {
+		id, ok := strings.CutPrefix(lines[0], prefix)
+		if !ok {
+			break
+		}
+
+		ids = append(ids, id)
+		lines = lines[1:]
+	}
+
+	return ids, lines
 }
 
 // validTool reports whether s is printable text that Marshal writes back as is.
