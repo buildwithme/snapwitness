@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,7 @@ import (
 	"github.com/buildwithme/snapwitness/internal/app"
 	"github.com/buildwithme/snapwitness/internal/config"
 	"github.com/buildwithme/snapwitness/internal/restic"
+	"github.com/buildwithme/snapwitness/internal/state"
 	"github.com/buildwithme/snapwitness/internal/witness"
 	"github.com/buildwithme/snapwitness/internal/witnesstest"
 	"github.com/buildwithme/snapwitness/internal/wlog"
@@ -84,6 +87,45 @@ func newEnv(t *testing.T, n, quorum int) *env {
 func (e *env) snapshots() string { return filepath.Join(e.cfg.Repo, "snapshots") }
 
 func (e *env) storage() string { return filepath.Dir(e.cfg.Repo) }
+
+func (e *env) entries() string { return filepath.Join(e.cfg.LogDir, wlog.EntriesFile) }
+
+func (e *env) checkpoint() string { return filepath.Join(e.cfg.LogDir, wlog.CheckpointFile) }
+
+// appendFrames writes raw frames to the entries file and signs nothing, the
+// way anyone with write access to the storage could.
+func (e *env) appendFrames(entries ...[]byte) {
+	e.t.Helper()
+
+	f, err := os.OpenFile(e.entries(), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+
+	for _, entry := range entries {
+		if _, err := f.Write(binary.BigEndian.AppendUint32(nil, uint32(len(entry)))); err != nil {
+			e.t.Fatal(err)
+		}
+
+		if _, err := f.Write(entry); err != nil {
+			e.t.Fatal(err)
+		}
+	}
+
+	if err := f.Close(); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func (e *env) wantWitnesses(step string, size int64) {
+	e.t.Helper()
+
+	for _, w := range e.ws {
+		if got := w.Size(e.cfg.Origin); got != size {
+			e.t.Errorf("%s: witness %s: got size %d, want %d", step, w.Name(), got, size)
+		}
+	}
+}
 
 // Snapshots is the keyed view. It lists the snapshot files the way restic
 // snapshots would with the password.
@@ -214,41 +256,6 @@ func (e *env) wantSizes(step string, logSize, checkpoint int64) {
 	}
 }
 
-// signCheckpoint signs the whole log with the log key and stores that
-// checkpoint without cosignatures.
-func (e *env) signCheckpoint() {
-	e.t.Helper()
-
-	key, err := os.ReadFile(e.cfg.KeyFile)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-
-	s, err := note.NewSigner(strings.TrimSpace(string(key)))
-	if err != nil {
-		e.t.Fatal(err)
-	}
-
-	l, err := wlog.Open(e.cfg.LogDir)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-
-	root, err := l.Root(l.Size())
-	if err != nil {
-		e.t.Fatal(err)
-	}
-
-	signed, err := wlog.Sign(wlog.Checkpoint{Origin: e.cfg.Origin, Size: l.Size(), Root: root}, s)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-
-	if err := l.WriteCheckpoint(signed); err != nil {
-		e.t.Fatal(err)
-	}
-}
-
 // expect checks the exit code of r and its warnings and alarms. Findings are
 // written like "ALARM rollback", in any order.
 func expect(t *testing.T, step string, r *app.Report, code int, findings ...string) {
@@ -323,12 +330,18 @@ func hashName(data []byte) string {
 // for each case, and checks what the audit says.
 func TestAudit(t *testing.T) {
 	later := func() time.Time { return time.Now().Add(27 * time.Hour) }
+	// witnesses cosign 10 minutes after this clock, more than the allowed skew
+	earlier := func() time.Time { return time.Now().Add(-10 * time.Minute) }
+
+	const escape = "notes\x1b[2J.txt"
+
 	tests := []struct {
 		name   string
 		damage func(e *env)
 		opts   app.AuditOptions
 		code   int
 		want   []string
+		check  func(t *testing.T, e *env, r *app.Report)
 	}{
 		{name: "clean", code: app.ExitOK},
 		{name: "offline", opts: app.AuditOptions{Offline: true}, code: app.ExitOK},
@@ -375,6 +388,28 @@ func TestAudit(t *testing.T) {
 			want:   []string{"WARN foreign"},
 		},
 		{
+			// A file name must not send terminal escape codes to the reader
+			name:   "foreign file with an escape code",
+			damage: func(e *env) { writeFile(e.t, filepath.Join(e.snapshots(), escape), []byte("hi")) },
+			code:   app.ExitOK,
+			want:   []string{"WARN foreign"},
+			check: func(t *testing.T, _ *env, r *app.Report) {
+				got := finding(t, r, "foreign").Details
+				if want := []string{strconv.Quote(escape)}; !slices.Equal(got, want) {
+					t.Errorf("got details %q, want %q", got, want)
+				}
+
+				var b strings.Builder
+				if err := r.WriteText(&b); err != nil {
+					t.Fatal(err)
+				}
+
+				if strings.Contains(b.String(), "\x1b") {
+					t.Errorf("got an escape code in the text report:\n%q", b.String())
+				}
+			},
+		},
+		{
 			name: "file too short for restic",
 			damage: func(e *env) {
 				writeFile(e.t, filepath.Join(e.snapshots(), hashName([]byte("short"))), []byte("short"))
@@ -390,15 +425,27 @@ func TestAudit(t *testing.T) {
 		},
 		{
 			name:   "checkpoint gone",
-			damage: func(e *env) { _ = os.Remove(filepath.Join(e.cfg.LogDir, wlog.CheckpointFile)) },
+			damage: func(e *env) { _ = os.Remove(e.checkpoint()) },
 			code:   app.ExitAlarm,
-			want:   []string{"ALARM tampered"},
+			want:   []string{"ALARM deleted"},
+		},
+		{
+			name: "log emptied and checkpoint gone",
+			damage: func(e *env) {
+				writeFile(e.t, e.entries(), nil)
+				_ = os.Remove(e.checkpoint())
+			},
+			code: app.ExitAlarm,
+			want: []string{"ALARM deleted"},
 		},
 		{
 			name: "checkpoint changed",
 			damage: func(e *env) {
-				path := filepath.Join(e.cfg.LogDir, wlog.CheckpointFile)
-				writeFile(e.t, path, bytes.Replace(readFile(e.t, path), []byte("\n3\n"), []byte("\n2\n"), 1))
+				writeFile(
+					e.t,
+					e.checkpoint(),
+					bytes.Replace(readFile(e.t, e.checkpoint()), []byte("\n3\n"), []byte("\n2\n"), 1),
+				)
 			},
 			code: app.ExitAlarm,
 			want: []string{"ALARM tampered"},
@@ -406,10 +453,9 @@ func TestAudit(t *testing.T) {
 		{
 			name: "entry changed",
 			damage: func(e *env) {
-				path := filepath.Join(e.cfg.LogDir, wlog.EntriesFile)
-				b := readFile(e.t, path)
+				b := readFile(e.t, e.entries())
 				b[4] = 'S'
-				writeFile(e.t, path, b)
+				writeFile(e.t, e.entries(), b)
 			},
 			code: app.ExitAlarm,
 			want: []string{"ALARM tampered"},
@@ -417,13 +463,61 @@ func TestAudit(t *testing.T) {
 		{
 			name: "log truncated",
 			damage: func(e *env) {
-				path := filepath.Join(e.cfg.LogDir, wlog.EntriesFile)
-				b := readFile(e.t, path)
+				b := readFile(e.t, e.entries())
 				first := 4 + int(binary.BigEndian.Uint32(b))
-				writeFile(e.t, path, b[:first])
+				writeFile(e.t, e.entries(), b[:first])
 			},
 			code: app.ExitAlarm,
 			want: []string{"ALARM tampered"},
+		},
+		{
+			name:   "torn frame",
+			damage: func(e *env) { writeFile(e.t, e.entries(), append(readFile(e.t, e.entries()), 0, 0)) },
+			code:   app.ExitAlarm,
+			want:   []string{"ALARM tampered"},
+		},
+		{
+			name:   "entry past the checkpoint",
+			damage: func(e *env) { e.appendFrames([]byte("not a state record")) },
+			code:   app.ExitAlarm,
+			want:   []string{"ALARM tampered"},
+		},
+		{
+			name:   "snapshots directory gone",
+			damage: func(e *env) { _ = os.RemoveAll(e.snapshots()) },
+			code:   app.ExitAlarm,
+			want:   []string{"ALARM deleted"},
+			check: func(t *testing.T, e *env, r *app.Report) {
+				details := finding(t, r, "deleted").Details
+				if len(details) != len(e.ids) {
+					t.Fatalf("got details %q, want one per recorded snapshot", details)
+				}
+
+				for i, id := range slices.Sorted(slices.Values(e.ids)) {
+					if !strings.Contains(details[i], id) {
+						t.Errorf("got detail %q, want %s in it", details[i], id)
+					}
+				}
+			},
+		},
+		{
+			name: "cosignatures from the future",
+			opts: app.AuditOptions{Now: earlier},
+			code: app.ExitAlarm,
+			want: []string{"ALARM stale", "WARN clock", "WARN clock"},
+			check: func(t *testing.T, _ *env, r *app.Report) {
+				var msgs []string
+
+				for _, f := range r.Findings {
+					if f.Kind == "clock" {
+						msgs = append(msgs, f.Message)
+					}
+				}
+
+				if len(msgs) != 2 || !strings.Contains(msgs[0], "w1.test") || !strings.Contains(msgs[1], "w2.test") {
+					t.Errorf("got clock warnings %q, want one naming each witness", msgs)
+				}
+			},
 		},
 		{
 			name: "stale",
@@ -456,7 +550,12 @@ func TestAudit(t *testing.T) {
 				tt.damage(e)
 			}
 
-			expect(t, "audit", e.audit(tt.opts), tt.code, tt.want...)
+			r := e.audit(tt.opts)
+			expect(t, "audit", r, tt.code, tt.want...)
+
+			if tt.check != nil {
+				tt.check(t, e, r)
+			}
 		})
 	}
 }
@@ -519,26 +618,33 @@ func TestRecordRefusesRemoved(t *testing.T) {
 	expect(t, "audit after the accepted record", e.audit(app.AuditOptions{}), app.ExitOK)
 }
 
-// TestRecordUnwitnessedRemoval: a removal that only sits in the unwitnessed
-// tail still needs -accept-removed on the next record. Anyone with write
-// access to the storage can add such an entry.
-func TestRecordUnwitnessedRemoval(t *testing.T) {
+// TestTailPastCheckpoint slips a record that removes a snapshot into the log,
+// with no checkpoint. Record must not build on it, even with
+// -accept-removed, and it must sign nothing.
+func TestTailPastCheckpoint(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, 2, 2)
 	e.backupAndRecord(3)
+	slipped := &state.Record{
+		Time:    time.Now().UTC().Truncate(time.Second),
+		Tool:    "restic",
+		Count:   2,
+		Set:     state.SetHash(e.ids[1:]),
+		Removed: []string{e.ids[0]},
+	}
+	e.appendFrames(slipped.Marshal())
 	e.remove(e.ids[0])
-	e.setDown(true)
-	r := e.record(app.RecordOptions{AcceptRemoved: true})
-	// Collect stops at the first failure once the quorum is out of reach
-	expect(t, "record with the witnesses down", r, app.ExitAlarm, "ALARM quorum", "WARN witness")
-	e.wantSizes("after the unwitnessed record", 4, 3)
 
-	e.setDown(false)
-	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM deleted")
+	r := e.record(app.RecordOptions{AcceptRemoved: true})
+	expect(t, "record", r, app.ExitAlarm, "ALARM tampered")
+
+	if msg := finding(t, r, "tampered").Message; !strings.Contains(msg, "1 log entry past the checkpoint") {
+		t.Errorf("got message %q, want it to count the entry past the checkpoint", msg)
+	}
+
 	e.wantSizes("after the refused record", 4, 3)
-	expect(t, "record -accept-removed", e.record(app.RecordOptions{AcceptRemoved: true}), app.ExitOK)
-	e.wantSizes("after the accepted record", 5, 5)
-	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitOK)
+	e.wantWitnesses("after the refused record", 3)
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM tampered", "ALARM deleted")
 }
 
 func TestRollback(t *testing.T) {
@@ -552,7 +658,7 @@ func TestRollback(t *testing.T) {
 	r := e.audit(app.AuditOptions{})
 	expect(t, "audit", r, app.ExitAlarm, "ALARM rollback")
 	f := finding(t, r, "rollback")
-	for _, want := range []string{"w1.test", "w2.test", "size 5", "serves size 3"} {
+	for _, want := range []string{"w1.test", "w2.test", "size 5", "checkpoint is size 3"} {
 		if !strings.Contains(f.Message, want) {
 			t.Errorf("got message %q, want %q in it", f.Message, want)
 		}
@@ -573,11 +679,82 @@ func TestRollback(t *testing.T) {
 
 	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback")
 	e.wantSizes("after the refused record", 3, 3)
+	e.wantWitnesses("after the refused record", 5)
+}
 
-	for _, w := range e.ws {
-		if got := w.Size(e.cfg.Origin); got != 5 {
-			t.Errorf("witness %s: got size %d, want 5", w.Name(), got)
-		}
+// TestRollbackWithTail rolls the storage back but leaves the entries file at
+// the size the witnesses have seen. That's still a rollback.
+func TestRollbackWithTail(t *testing.T) {
+	t.Parallel()
+	t.Run("old checkpoint put back", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t, 2, 2)
+		e.backupAndRecord(3)
+		cp3 := readFile(t, e.checkpoint())
+		e.backupAndRecord(1)
+		writeFile(t, e.checkpoint(), cp3)
+		e.remove(e.ids[3])
+
+		expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		e.wantSizes("after the refused record", 4, 3)
+		e.wantWitnesses("after the refused record", 4)
+	})
+	t.Run("old copy padded with junk", func(t *testing.T) {
+		t.Parallel()
+		e := newEnv(t, 2, 2)
+		e.backupAndRecord(3)
+		p3 := e.save()
+		e.backupAndRecord(2)
+		e.restore(p3)
+		e.appendFrames([]byte("junk frame one"), []byte("junk frame two"))
+
+		expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		e.wantSizes("after the refused record", 5, 3)
+		e.wantWitnesses("after the refused record", 5)
+	})
+}
+
+// TestRollbackToGenesis empties the log and puts back the size 0 checkpoint
+// from init. The witnesses are at 3, which makes it a rollback.
+func TestRollbackToGenesis(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	genesis := readFile(t, e.checkpoint())
+	e.backupAndRecord(3)
+	writeFile(t, e.entries(), nil)
+	writeFile(t, e.checkpoint(), genesis)
+
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM stale", "WARN unrecorded")
+	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback")
+	e.wantSizes("after the refused record", 0, 0)
+	e.wantWitnesses("after the refused record", 3)
+}
+
+// TestAuditTimeout cuts an audit short while one witness is slow. A rollback
+// the fast witness proved before the timeout has to stay in the report.
+func TestAuditTimeout(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(3)
+	p3 := e.save()
+	e.backupAndRecord(2)
+	e.restore(p3)
+	e.ws[1].SetDelay(time.Minute)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+
+	r := app.Audit(ctx, e.cfg, e.wc, app.AuditOptions{})
+	expect(t, "audit", r, app.ExitAlarm, "ALARM rollback")
+
+	if !strings.Contains(r.Err, "deadline") {
+		t.Errorf("got error %q, want the timeout", r.Err)
+	}
+
+	if msg := finding(t, r, "rollback").Message; !strings.Contains(msg, "witness w1.test has seen log size 5") {
+		t.Errorf("got message %q, want the witness that answered", msg)
 	}
 }
 
@@ -588,20 +765,23 @@ func TestFork(t *testing.T) {
 	p2 := e.save()
 	e.backupAndRecord(1)
 
-	// a different third record on the old copy, witnesses down, then sign it.
-	// Now the log key has signed two histories of size 3
+	// a different third record on the old copy, witnesses down. Record stores
+	// its log-signed checkpoint before asking them, which means the log key
+	// has now signed two histories of size 3
 	e.restore(p2)
 	e.setDown(true)
 	e.backup()
 	e.record(app.RecordOptions{})
 	e.setDown(false)
-	e.signCheckpoint()
 
 	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM fork", "ALARM stale")
 	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM fork")
 	e.wantSizes("after the refused record", 3, 3)
 }
 
+// TestQuorumLoss records with one of two witnesses down. The checkpoint is
+// stored anyway. Once the witness is back, an audit brings it up to date
+// with no rollback alarm, whichever answer Collect sees first.
 func TestQuorumLoss(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, 2, 2)
@@ -609,11 +789,19 @@ func TestQuorumLoss(t *testing.T) {
 	e.ws[1].SetDown(true)
 	e.backup()
 
-	expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM quorum", "WARN witness")
-	e.wantSizes("after the record without quorum", 4, 3)
-	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitOK, "WARN pending", "WARN unrecorded", "WARN witness")
+	r := e.record(app.RecordOptions{})
+	expect(t, "record", r, app.ExitAlarm, "ALARM quorum", "WARN witness")
+
+	if msg := finding(t, r, "quorum").Message; !strings.Contains(msg, "the checkpoint is saved") {
+		t.Errorf("got message %q, want it to say the checkpoint is saved", msg)
+	}
+
+	e.wantSizes("after the record without quorum", 4, 4)
+	expect(t, "audit with a witness down", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM stale", "WARN witness")
 
 	e.ws[1].SetDown(false)
+	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitOK)
+	e.wantWitnesses("after the audit", 4)
 	expect(t, "record again", e.record(app.RecordOptions{}), app.ExitOK)
 	e.wantSizes("after the record with quorum", 5, 5)
 	expect(t, "audit again", e.audit(app.AuditOptions{}), app.ExitOK)
@@ -632,6 +820,72 @@ func TestQuorumLossOnFirstRecord(t *testing.T) {
 	e.ws[1].SetDown(false)
 	expect(t, "record again", e.record(app.RecordOptions{}), app.ExitOK)
 	expect(t, "audit again", e.audit(app.AuditOptions{}), app.ExitOK)
+}
+
+// slowAfterList is the keyed view of e, and slows one witness once record has
+// listed the snapshots. Only the cosign request after the append is slow.
+type slowAfterList struct {
+	*env
+	slow *witnesstest.Witness
+}
+
+func (s slowAfterList) Snapshots(ctx context.Context) ([]restic.Snapshot, error) {
+	s.slow.SetDelay(time.Minute)
+	return s.env.Snapshots(ctx)
+}
+
+// cancelOnCut cancels the caller when a witness request gets cut, like an
+// interrupt right after the quorum stop.
+type cancelOnCut struct{ cancel context.CancelFunc }
+
+func (c cancelOnCut) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := http.DefaultTransport.RoundTrip(req)
+	if req.Context().Err() != nil {
+		c.cancel()
+	}
+
+	return resp, err
+}
+
+// TestRecordInterrupted cancels a record right after the quorum cosigned.
+// The cosignatures we got back must still be stored.
+func TestRecordInterrupted(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 1)
+	e.backupAndRecord(1)
+	e.backup()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	wc := &witness.Client{HTTP: &http.Client{Transport: cancelOnCut{cancel}}}
+	r := app.Record(ctx, e.cfg, slowAfterList{e, e.ws[1]}, wc, app.RecordOptions{})
+
+	if ctx.Err() == nil {
+		t.Fatal("got no interrupt, want the cut request to cancel the record")
+	}
+
+	expect(t, "record", r, app.ExitOK)
+	e.wantSizes("after the interrupted record", 2, 2)
+
+	logKey, err := e.cfg.LogVerifier()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	keys, err := e.cfg.WitnessVerifiers()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := wlog.Verify(readFile(t, e.checkpoint()), logKey, keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(v.Cosigs) != 1 || v.Cosigs[0].Name != "w1.test" {
+		t.Errorf("got cosignatures %+v, want the one from w1.test", v.Cosigs)
+	}
 }
 
 type failingSource struct{}
@@ -685,13 +939,13 @@ func TestAuditAll(t *testing.T) {
 	slow, fast := newEnv(t, 1, 1), newEnv(t, 1, 1)
 	slow.backupAndRecord(1)
 	fast.backupAndRecord(1)
-	slow.ws[0].SetDelay(10 * time.Second)
+	slow.ws[0].SetDelay(time.Minute)
 
 	start := time.Now()
 	cfgs := []*config.Config{slow.cfg, fast.cfg}
-	reports := app.AuditAll(t.Context(), cfgs, &witness.Client{}, app.AuditOptions{}, 500*time.Millisecond)
+	reports := app.AuditAll(t.Context(), cfgs, &witness.Client{}, app.AuditOptions{}, 5*time.Second)
 
-	if took := time.Since(start); took > 5*time.Second {
+	if took := time.Since(start); took > 30*time.Second {
 		t.Errorf("got %s, want the timeout to cut the slow audit", took)
 	}
 
@@ -748,6 +1002,20 @@ func TestInit(t *testing.T) {
 		t.Errorf("got key file mode %o, want 600", mode)
 	}
 
+	logKey, err := cfg.LogVerifier()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v, err := wlog.Verify(readFile(t, filepath.Join(cfg.LogDir, wlog.CheckpointFile)), logKey, nil)
+	if err != nil {
+		t.Fatalf("genesis checkpoint: %v", err)
+	}
+
+	if v.Size != 0 || len(readFile(t, filepath.Join(cfg.LogDir, wlog.EntriesFile))) != 0 {
+		t.Errorf("got checkpoint size %d, want an empty log with a size 0 checkpoint", v.Size)
+	}
+
 	for _, want := range []string{
 		"witnessctl add-log -db <db> -origin " + cfg.Origin,
 		"witnessctl add-key -db <db> -origin " + cfg.Origin + " -key " + cfg.LogKey,
@@ -773,21 +1041,33 @@ func TestInitRejects(t *testing.T) {
 	good := config.Witness{VKey: w.VKey(), URL: w.URL()}
 	tests := []struct {
 		name   string
-		change func(o *app.InitOptions)
+		change func(t *testing.T, o *app.InitOptions)
 	}{
-		{"upper case name", func(o *app.InitOptions) { o.Name = "Demo" }},
-		{"empty name", func(o *app.InitOptions) { o.Name = "" }},
-		{"long name", func(o *app.InitOptions) { o.Name = strings.Repeat("a", 33) }},
-		{"quorum 0", func(o *app.InitOptions) { o.Quorum = 0 }},
-		{"quorum above witnesses", func(o *app.InitOptions) { o.Quorum = 2 }},
-		{
-			"bad witness key",
-			func(o *app.InitOptions) { o.Witnesses = []config.Witness{{VKey: "w1+00000000+bad", URL: w.URL()}} },
-		},
-		{"log exists", func(o *app.InitOptions) {
+		{"upper case name", func(_ *testing.T, o *app.InitOptions) { o.Name = "Demo" }},
+		{"empty name", func(_ *testing.T, o *app.InitOptions) { o.Name = "" }},
+		{"long name", func(_ *testing.T, o *app.InitOptions) { o.Name = strings.Repeat("a", 33) }},
+		{"quorum 0", func(_ *testing.T, o *app.InitOptions) { o.Quorum = 0 }},
+		{"quorum above witnesses", func(_ *testing.T, o *app.InitOptions) { o.Quorum = 2 }},
+		{"bad witness key", func(_ *testing.T, o *app.InitOptions) {
+			o.Witnesses = []config.Witness{{VKey: "w1+00000000+bad", URL: w.URL()}}
+		}},
+		{"log exists", func(t *testing.T, o *app.InitOptions) {
 			if err := wlog.Create(o.LogDir); err != nil {
 				t.Fatal(err)
 			}
+		}},
+		{"checkpoint left over", func(t *testing.T, o *app.InitOptions) {
+			if err := os.MkdirAll(o.LogDir, 0o750); err != nil {
+				t.Fatal(err)
+			}
+
+			writeFile(t, filepath.Join(o.LogDir, wlog.CheckpointFile), []byte("old"))
+		}},
+		{"key inside the log dir", func(_ *testing.T, o *app.InitOptions) {
+			o.ConfigPath = filepath.Join(o.LogDir, "snapwitness.conf")
+		}},
+		{"key inside the repo", func(_ *testing.T, o *app.InitOptions) {
+			o.ConfigPath = filepath.Join(o.Repo, "conf", "snapwitness.conf")
 		}},
 	}
 
@@ -802,15 +1082,15 @@ func TestInitRejects(t *testing.T) {
 				Witnesses:  []config.Witness{good},
 				Quorum:     1,
 			}
-			tt.change(&opts)
+			tt.change(t, &opts)
 
 			if _, err := app.Init(opts, io.Discard); err == nil {
 				t.Fatal("got no error, want init to refuse")
 			}
 
-			for _, name := range []string{"snapwitness.conf", "log.key"} {
-				if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
-					t.Errorf("%s: got %v, want no file left behind", name, err)
+			for _, path := range []string{opts.ConfigPath, filepath.Join(filepath.Dir(opts.ConfigPath), "log.key")} {
+				if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+					t.Errorf("%s: got %v, want no file left behind", path, err)
 				}
 			}
 		})
@@ -906,5 +1186,22 @@ func TestReportWrite(t *testing.T) {
 
 	if !strings.Contains(b.String(), "\n  \"command\"") {
 		t.Errorf("got %s, want two-space indent", b.String())
+	}
+
+	if strings.Contains(b.String(), `"time"`) {
+		t.Errorf("got %s, want no time for a witness without one", b.String())
+	}
+
+	var back app.Report
+	if err := json.Unmarshal(b.Bytes(), &back); err != nil {
+		t.Fatalf("decode into a report: %v", err)
+	}
+
+	if !reflect.DeepEqual(back.Findings, r.Findings) || back.ExitCode() != app.ExitAlarm {
+		t.Errorf("got findings %+v, want %+v", back.Findings, r.Findings)
+	}
+
+	if err := json.Unmarshal([]byte(`{"findings":[{"severity":"LOUD"}]}`), &back); err == nil {
+		t.Error("got no error for an unknown severity, want one")
 	}
 }

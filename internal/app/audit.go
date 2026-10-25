@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,7 +32,9 @@ type AuditOptions struct {
 }
 
 // Audit checks the storage against the log and the witnesses. It needs
-// neither the restic password nor the log signing key.
+// neither the restic password nor the log signing key. If ctx ends first it
+// sets Err, but still judges the answers that came back. An alarm found
+// before a timeout isn't lost.
 func Audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts AuditOptions) *Report {
 	start := time.Now()
 
@@ -51,35 +56,13 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 		return fmt.Errorf("app: audit: %w", err)
 	}
 
-	l, err := wlog.Open(cfg.LogDir)
-	if errors.Is(err, wlog.ErrNoLog) {
-		r.Add(Alarm, "deleted", "the log is gone from the storage")
-		return nil
-	}
-
-	if err != nil {
-		return fmt.Errorf("app: audit: %w", err)
-	}
-
-	r.LogSize = l.Size()
-	cp, err := l.ReadCheckpoint()
-
-	switch {
-	case errors.Is(err, wlog.ErrNoCheckpoint) && l.Size() == 0:
-		return errors.New("app: audit: no checkpoint yet, run snapwitness record first")
-	case errors.Is(err, wlog.ErrNoCheckpoint):
-		r.Add(Alarm, "tampered", fmt.Sprintf("the log has %d entries but no checkpoint", l.Size()))
-		return nil
-	case err != nil:
-		return fmt.Errorf("app: audit: %w", err)
-	}
-
-	v := checkStored(r, l, cp, logKey, witnessKeys)
+	l, v := readStored(r, cfg.LogDir, logKey, witnessKeys)
 	if v == nil {
 		return nil
 	}
 
 	n := v.Size
+	tail(r, l, n)
 
 	st, err := state.Replay(l.Entries(n))
 	if err != nil {
@@ -107,46 +90,61 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 	}
 
 	listErr := g.Wait()
-	// stop on a timeout or an interrupt, the answers so far can't be trusted
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("app: audit: %w", err)
-	}
+	ctxErr := ctx.Err()
 
 	if opts.Offline {
 		r.Witnesses = stored(ws, v.Cosigs)
 	} else {
 		r.Witnesses = statuses(outs, n)
 		debugOutcomes("audit", outs)
-
-		if vd := judge(r, outs, n, l.Size(), true); len(vd.pending) > 0 {
-			r.Add(Warn, "pending", "a record run did not finish; run snapwitness record again", vd.pending...)
-		}
+		judge(r, outs, n, ctxErr, map[string]bool{})
 	}
 
 	checkFresh(r, cfg, now, st, v.Cosigs, outs)
 
-	if listErr != nil {
-		r.line("log", "size %d, checkpoint %d, log key %08x", l.Size(), n, logKey.KeyHash())
-		return fmt.Errorf("app: audit: %w", listErr)
+	switch {
+	case listErr == nil:
+		slog.Debug("listed", "repo", cfg.Repo, "files", listing.Files, "bytes", listing.Bytes)
+		r.Snapshots = len(listing.IDs)
+		r.line(
+			"repo",
+			"%s  %d snapshots, %d files re-hashed",
+			cfg.Repo,
+			len(listing.IDs),
+			listing.Files-len(listing.Foreign),
+		)
+		compare(r, l, st, listing)
+	case ctxErr != nil:
+		// listing was cut short, nothing to compare
+	case errors.Is(listErr, fs.ErrNotExist):
+		ids := st.Sorted()
+		details := make([]string, len(ids))
+
+		for i, id := range ids {
+			details[i] = fmt.Sprintf("missing %s recorded %s", id, st.IDs[id].Time.Format(state.TimeFormat))
+		}
+
+		r.Add(Alarm, "deleted", "the snapshots directory is gone", details...)
+	default:
+		r.Add(Alarm, "tampered", "the snapshots directory cannot be read", fmt.Sprintf("%q", listErr.Error()))
 	}
 
-	slog.Debug("listed", "repo", cfg.Repo, "files", listing.Files, "bytes", listing.Bytes)
-	r.Snapshots = len(listing.IDs)
-	r.line(
-		"repo",
-		"%s  %d snapshots, %d files re-hashed",
-		cfg.Repo,
-		len(listing.IDs),
-		listing.Files-len(listing.Foreign),
-	)
 	r.line("log", "size %d, checkpoint %d, log key %08x", l.Size(), n, logKey.KeyHash())
-	compare(r, l, st, listing)
+
+	if ctxErr != nil {
+		return fmt.Errorf("app: audit: %w", ctxErr)
+	}
+
+	if st.Last == nil {
+		return errors.New("app: audit: no state recorded yet, run snapwitness record first")
+	}
 
 	return nil
 }
 
 // compare checks the replayed snapshot set against the files the storage
-// serves.
+// serves. Names from the storage are quoted in the details. A file name
+// could carry terminal escape codes into the report otherwise.
 func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 	unrecorded, missing := state.Diff(st.IDs, listing.IDs)
 	if len(missing) > 0 {
@@ -176,7 +174,7 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 			Warn,
 			"unrecorded",
 			plural(len(unrecorded), "snapshot")+" on the storage not in the log (a backup without record?)",
-			unrecorded...)
+			quote(unrecorded)...)
 	}
 
 	if len(listing.Mismatch) > 0 {
@@ -184,17 +182,36 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 			Alarm,
 			"tampered",
 			plural(len(listing.Mismatch), "snapshot file")+" changed in place: the content does not match the name",
-			listing.Mismatch...)
+			quote(listing.Mismatch)...)
 	}
 
 	if foreign := slices.Concat(listing.Foreign, listing.TooShort); len(foreign) > 0 {
-		r.Add(Warn, "foreign", plural(len(foreign), "file")+" in snapshots/ that restic would not read", foreign...)
+		r.Add(
+			Warn,
+			"foreign",
+			plural(len(foreign), "file")+" in snapshots/ that restic would not read",
+			quote(foreign)...)
 	}
 }
 
+func quote(names []string) []string {
+	out := make([]string, len(names))
+	for i, s := range names {
+		out[i] = strconv.Quote(s)
+	}
+
+	return out
+}
+
+// clockSkew is how far in the future a cosignature may be dated and still
+// count. Enough for clocks that drift a little. A forged time far ahead would
+// keep a log fresh forever.
+const clockSkew = 5 * time.Minute
+
 // checkFresh raises a stale alarm when fewer than a quorum of witnesses
 // confirmed the log within MaxAge, or when there's no record that recent.
-// Each witness counts with its newest cosignature, stored or fresh.
+// Each witness counts with its newest cosignature, stored or fresh. One
+// dated more than clockSkew ahead doesn't count.
 func checkFresh(
 	r *Report,
 	cfg *config.Config,
@@ -204,8 +221,12 @@ func checkFresh(
 	outs []witness.Outcome,
 ) {
 	newest := map[string]time.Time{}
+	future := map[string]time.Time{}
 	vouch := func(c wlog.Cosig) {
-		if c.Time.After(newest[c.Name]) {
+		switch {
+		case c.Time.After(now.Add(clockSkew)):
+			future[c.Name] = c.Time
+		case c.Time.After(newest[c.Name]):
 			newest[c.Name] = c.Time
 		}
 	}
@@ -218,6 +239,20 @@ func checkFresh(
 		if o.Cosig != nil {
 			vouch(*o.Cosig)
 		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(future)) {
+		t := future[name]
+		r.Add(
+			Warn,
+			"clock",
+			fmt.Sprintf(
+				"witness %s cosigned at %s, %s in the future: check its clock and this one",
+				name,
+				t.Format(state.TimeFormat),
+				t.Sub(now).Round(time.Second),
+			),
+		)
 	}
 
 	fresh := 0
@@ -242,10 +277,7 @@ func checkFresh(
 		)
 	}
 
-	switch {
-	case st.Last == nil:
-		r.Add(Alarm, "stale", "no state recorded yet")
-	case now.Sub(st.Last.Time) > cfg.MaxAge:
+	if st.Last != nil && now.Sub(st.Last.Time) > cfg.MaxAge {
 		r.Add(
 			Alarm,
 			"stale",
@@ -312,6 +344,35 @@ func trust(cfg *config.Config) (note.Verifier, []note.Verifier, []witness.Witnes
 	return logKey, keys, ws, nil
 }
 
+// readStored opens the log and verifies the stored checkpoint. When either is
+// gone, unreadable or doesn't verify, it raises an alarm and returns a nil
+// checkpoint.
+func readStored(r *Report, dir string, logKey note.Verifier, witnessKeys []note.Verifier) (*wlog.Log, *wlog.Verified) {
+	l, err := wlog.Open(dir)
+	switch {
+	case errors.Is(err, wlog.ErrNoLog):
+		r.Add(Alarm, "deleted", "the log is gone from the storage")
+		return nil, nil
+	case err != nil:
+		r.Add(Alarm, "tampered", "the log cannot be read: "+err.Error())
+		return nil, nil
+	}
+
+	r.LogSize = l.Size()
+	cp, err := l.ReadCheckpoint()
+
+	switch {
+	case errors.Is(err, wlog.ErrNoCheckpoint):
+		r.Add(Alarm, "deleted", "the checkpoint is gone from the storage")
+		return l, nil
+	case err != nil:
+		r.Add(Alarm, "tampered", "the log cannot be read: "+err.Error())
+		return l, nil
+	}
+
+	return l, checkStored(r, l, cp, logKey, witnessKeys)
+}
+
 // checkStored verifies the stored checkpoint and checks the storage still
 // serves every entry it covers. On failure it raises a tampered alarm and
 // returns nil.
@@ -341,19 +402,35 @@ func checkStored(r *Report, l *wlog.Log, cp []byte, logKey note.Verifier, witnes
 	return v
 }
 
-// verdict is what the witnesses said about a checkpoint.
-type verdict struct {
-	rollback bool // a witness saw a bigger log than the storage serves
-	fork     bool
-	pending  []string // at a size the storage has but no stored checkpoint covers
+// tail raises a tampered alarm and returns true when the log has entries past
+// the checkpoint of size n. Either the storage added them or a record run
+// stopped between append and checkpoint write. Nothing may build on them.
+func tail(r *Report, l *wlog.Log, n int64) bool {
+	k := l.Size() - n
+	if k <= 0 {
+		return false
+	}
+
+	entries := fmt.Sprintf("%d log entries", k)
+	if k == 1 {
+		entries = "1 log entry"
+	}
+
+	r.Add(
+		Alarm,
+		"tampered",
+		entries+" past the checkpoint that no witness has seen: the storage added them, or a record run stopped between its append and its checkpoint write; see LIMITATIONS.md",
+	)
+
+	return true
 }
 
 // judge turns the witness answers for a checkpoint of size n into findings.
-// served is how many entries the storage serves. Other witness errors only
-// become warnings with warn set.
-func judge(r *Report, outs []witness.Outcome, n, served int64, warn bool) verdict {
+// An honest storage always has the newest checkpoint. A witness that has seen
+// a bigger log proves a rollback, one with a different tree a fork. Other
+// errors give one warning per witness; warned tracks that across calls.
+func judge(r *Report, outs []witness.Outcome, n int64, ctxErr error, warned map[string]bool) (rollback, fork bool) {
 	var (
-		vd            verdict
 		ahead, forked []string
 		seen          int64
 	)
@@ -361,37 +438,32 @@ func judge(r *Report, outs []witness.Outcome, n, served int64, warn bool) verdic
 	for _, o := range outs {
 		var conflict *witness.ConflictError
 		switch {
-		case o.Cosig != nil, errors.Is(o.Err, context.Canceled):
-			// cosigned, or cut by the quorum stop: nothing to judge
-		case errors.As(o.Err, &conflict) && conflict.Size > served:
+		case o.Cosig != nil, errors.Is(o.Err, context.Canceled), ctxErr != nil && errors.Is(o.Err, ctxErr):
+			// cosigned, or cut short: nothing to judge
+		case errors.As(o.Err, &conflict) && conflict.Size > n:
 			ahead = append(ahead, o.Witness)
 			seen = max(seen, conflict.Size)
-		case errors.As(o.Err, &conflict) && conflict.Size > n:
-			vd.pending = append(vd.pending, fmt.Sprintf("witness %s has seen size %d", o.Witness, conflict.Size))
 		case errors.Is(o.Err, witness.ErrInconsistent):
 			forked = append(forked, o.Witness)
-		case warn:
+		case !warned[o.Witness]:
+			warned[o.Witness] = true
 			r.Add(Warn, "witness", o.Err.Error())
 		}
 	}
 
 	if len(ahead) > 0 {
-		vd.rollback = true
-
 		r.Add(
 			Alarm,
 			"rollback",
-			fmt.Sprintf("%s seen log size %d, the storage serves size %d", who(ahead), seen, served),
+			fmt.Sprintf("%s seen log size %d, the storage's checkpoint is size %d", who(ahead), seen, n),
 		)
 	}
 
 	if len(forked) > 0 {
-		vd.fork = true
-
 		r.Add(Alarm, "fork", fmt.Sprintf("%s cosigned a different log at size %d", who(forked), n))
 	}
 
-	return vd
+	return len(ahead) > 0, len(forked) > 0
 }
 
 func who(names []string) string {

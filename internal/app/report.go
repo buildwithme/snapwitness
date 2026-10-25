@@ -46,10 +46,23 @@ func (s Severity) MarshalText() ([]byte, error) {
 	return []byte(s.String()), nil
 }
 
+// UnmarshalText reads back a name written by MarshalText, for decoding a
+// JSON report.
+func (s *Severity) UnmarshalText(b []byte) error {
+	for _, v := range []Severity{Info, Warn, Alarm} {
+		if string(b) == v.String() {
+			*s = v
+			return nil
+		}
+	}
+
+	return fmt.Errorf("app: unknown severity %q", b)
+}
+
 // Finding is one result line of a check.
 type Finding struct {
 	Severity Severity `json:"severity"`
-	Kind     string   `json:"kind"` // deleted, rollback, fork, stale, tampered, unrecorded, foreign, witness, pending, quorum
+	Kind     string   `json:"kind"` // deleted, rollback, fork, stale, tampered, unrecorded, foreign, witness, clock, quorum
 	Message  string   `json:"message"`
 	Details  []string `json:"details,omitempty"`
 }
@@ -59,7 +72,7 @@ type WitnessStatus struct {
 	Name   string        `json:"name"`
 	Status string        `json:"status"` // "cosigned", "conflict", "unreachable", "error", "skipped"
 	Size   int64         `json:"size,omitempty"`
-	Time   time.Time     `json:"time"`
+	Time   time.Time     `json:"time,omitzero"`
 	Took   time.Duration `json:"took_ns,omitempty"`
 	Error  string        `json:"error,omitempty"`
 }

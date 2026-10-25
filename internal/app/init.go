@@ -33,9 +33,10 @@ type InitOptions struct {
 
 var validName = regexp.MustCompile(`^[a-z0-9-]{1,32}$`)
 
-// Init creates a log origin and key, the empty log and the config file. It
-// won't overwrite any of them. On out it prints the origin, the log vkey, the
-// paths and the commands to register the log with each witness.
+// Init creates a log origin and key, the empty log with its signed size 0
+// checkpoint, and the config file. It won't overwrite any of them. On out it
+// prints the origin, the log vkey, the paths and the commands to register
+// the log with each witness.
 func Init(opts InitOptions, out io.Writer) (*config.Config, error) {
 	if !validName.MatchString(opts.Name) {
 		return nil, fmt.Errorf("app: init: name %q: want 1 to 32 of a-z, 0-9 and -", opts.Name)
@@ -93,10 +94,26 @@ func Init(opts InitOptions, out io.Writer) (*config.Config, error) {
 		return nil, fmt.Errorf("app: init: %w", err)
 	}
 
+	// config and secret key stay off the storage they guard. Whoever controls
+	// the storage could swap the one or sign with the other
+	for _, p := range []string{path, cfg.KeyFile} {
+		for _, dir := range []string{repo, logDir} {
+			if inside(dir, p) {
+				return nil, fmt.Errorf(
+					"app: init: %s is inside %s: keep the config and the log key off the backup storage",
+					p,
+					dir,
+				)
+			}
+		}
+	}
+
 	// check all targets before we write anything. A refused init leaves
 	// nothing behind
 	entries := filepath.Join(logDir, wlog.EntriesFile)
-	for _, p := range []string{path, cfg.KeyFile, entries} {
+	checkpoint := filepath.Join(logDir, wlog.CheckpointFile)
+
+	for _, p := range []string{path, cfg.KeyFile, entries, checkpoint} {
 		_, err := os.Lstat(p)
 		if err == nil {
 			return nil, fmt.Errorf("app: init: %s: %w", p, fs.ErrExist)
@@ -120,9 +137,15 @@ func Init(opts InitOptions, out io.Writer) (*config.Config, error) {
 		return nil, fmt.Errorf("app: init: %w", err)
 	}
 
-	if err := config.Save(path, cfg); err != nil {
+	err = writeGenesis(logDir, origin, skey)
+	if err == nil {
+		err = config.Save(path, cfg)
+	}
+
+	if err != nil {
 		_ = os.Remove(cfg.KeyFile)
 		_ = os.Remove(entries)
+		_ = os.Remove(checkpoint)
 
 		return nil, fmt.Errorf("app: init: %w", err)
 	}
@@ -147,6 +170,38 @@ func Init(opts InitOptions, out io.Writer) (*config.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// writeGenesis stores the signed checkpoint of the empty log. With a checkpoint
+// from day one, a missing one is always a deletion, and we can ask the
+// witnesses about the log before the first record.
+func writeGenesis(logDir, origin, skey string) error {
+	s, err := note.NewSigner(skey)
+	if err != nil {
+		return err
+	}
+
+	l, err := wlog.Open(logDir)
+	if err != nil {
+		return err
+	}
+
+	root, err := l.Root(0)
+	if err != nil {
+		return err
+	}
+
+	signed, err := wlog.Sign(wlog.Checkpoint{Origin: origin, Size: 0, Root: root}, s)
+	if err != nil {
+		return err
+	}
+
+	return l.WriteCheckpoint(signed)
+}
+
+func inside(dir, path string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && filepath.IsLocal(rel)
 }
 
 // writeKey writes the private log key with mode 0600, never over an existing

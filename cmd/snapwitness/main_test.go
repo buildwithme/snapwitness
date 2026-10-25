@@ -145,6 +145,7 @@ func TestRunFlow(t *testing.T) {
 		"-quorum",
 		"1",
 	)
+	// audit before the first record: nothing to check yet
 	snapwitness(t, app.ExitError, "audit", "-c", conf)
 
 	data := []byte("first snapshot file, at least 32 bytes long")
@@ -175,6 +176,16 @@ func TestRunFlow(t *testing.T) {
 	}
 
 	snapwitness(t, app.ExitAlarm, "audit", "-c", conf)
+
+	report = app.Report{}
+	if err := json.Unmarshal([]byte(snapwitness(t, app.ExitAlarm, "audit", "-c", conf, "-json")), &report); err != nil {
+		t.Fatalf("decode the JSON report with an alarm: %v", err)
+	}
+
+	if len(report.Findings) != 1 || report.Findings[0].Severity != app.Alarm || report.Findings[0].Kind != "deleted" {
+		t.Errorf("got findings %+v, want one deleted alarm", report.Findings)
+	}
+
 	// the alarm wins over the error from missing.conf
 	snapwitness(t, app.ExitAlarm, "audit", "-c", conf, "-c", filepath.Join(dir, "missing.conf"))
 	snapwitness(t, app.ExitAlarm, "record", "-c", conf, "-restic", resticBin)

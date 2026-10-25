@@ -2,9 +2,7 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"slices"
 	"strings"
@@ -78,78 +76,41 @@ func record(
 		return err
 	}
 
-	l, err := wlog.Open(cfg.LogDir)
-	if errors.Is(err, wlog.ErrNoLog) {
-		r.Add(Alarm, "deleted", "the log is gone from the storage")
+	l, cp := readStored(r, cfg.LogDir, logKey, witnessKeys)
+	if cp == nil {
 		return nil
 	}
 
-	if err != nil {
-		return fmt.Errorf("app: record: %w", err)
-	}
-
-	var cp *wlog.Verified // nil before the first record
-
-	var n int64 // the size it covers
+	n := cp.Size
 
 	defer func() {
 		r.LogSize = l.Size()
 		r.line("log", "size %d, checkpoint %d", l.Size(), n)
 	}()
 
-	stored, err := l.ReadCheckpoint()
-	switch {
-	case errors.Is(err, wlog.ErrNoCheckpoint):
-		// no checkpoint is only fine for an empty log. Deleting it can't be
-		// allowed to reset what the witnesses have seen
-		if l.Size() > 0 {
-			r.Add(Alarm, "tampered", fmt.Sprintf("the log has %d entries but no checkpoint", l.Size()))
-			return nil
-		}
-	case err != nil:
-		return fmt.Errorf("app: record: %w", err)
-	default:
-		if cp = checkStored(r, l, stored, logKey, witnessKeys); cp == nil {
-			return nil
-		}
-
-		n = cp.Size
-	}
-
 	// Probe the witnesses before we append. A new record must never build on
 	// a rolled-back copy.
-	if n > 0 {
-		outs := wc.Collect(ctx, ws, witness.Request{Signed: cp.Signed, Size: n, OldSize: n, Proof: proofTo(l, n)}, 0)
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("app: record: %w", err)
-		}
+	outs := wc.Collect(ctx, ws, witness.Request{Signed: cp.Signed, Size: n, OldSize: n, Proof: proofTo(l, n)}, 0)
+	r.Witnesses = statuses(outs, n)
+	debugOutcomes("record probe", outs)
 
-		r.Witnesses = statuses(outs, n)
-		debugOutcomes("record probe", outs)
-		vd := judge(r, outs, n, l.Size(), false)
-		if vd.rollback || vd.fork {
-			return nil
-		}
+	warned := map[string]bool{}
+	rollback, fork := judge(r, outs, n, ctx.Err(), warned)
+	// Never sign entries past the checkpoint, because no witness has seen them
+	tampered := tail(r, l, n)
 
-		if len(vd.pending) > 0 {
-			r.Add(Info, "pending", "a record run did not finish; this run completes it", vd.pending...)
-		}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("app: record: %w", err)
 	}
 
-	// replay everything, the unwitnessed tail too. The new record follows the
-	// last entry
-	st, err := state.Replay(l.Entries(l.Size()))
-	if err != nil {
-		r.Add(Alarm, "tampered", "the log records do not replay", err.Error())
+	if rollback || fork || tampered {
 		return nil
 	}
 
-	witnessed := st
-	if n < l.Size() {
-		if witnessed, err = state.Replay(l.Entries(n)); err != nil {
-			r.Add(Alarm, "tampered", "the log records do not replay", err.Error())
-			return nil
-		}
+	st, err := state.Replay(l.Entries(n))
+	if err != nil {
+		r.Add(Alarm, "tampered", "the log records do not replay", err.Error())
+		return nil
 	}
 
 	snaps, err := src.Snapshots(ctx)
@@ -168,14 +129,17 @@ func record(
 	r.Snapshots = len(ids)
 	r.line("snapshots", "%d (+%d -%d)", len(ids), len(added), len(removed))
 
-	// check removals against the witnessed state as well. An entry slipped
-	// into the unwitnessed tail mustn't hide a deletion
-	if gone := lost(ids, witnessed, st); len(gone) > 0 && !opts.AcceptRemoved {
+	if len(removed) > 0 && !opts.AcceptRemoved {
+		details := make([]string, 0, len(removed)+1)
+		for _, id := range removed {
+			details = append(details, st.IDs[id].Time.Format(state.TimeFormat)+" "+id)
+		}
+
 		r.Add(
 			Alarm,
 			"deleted",
-			plural(len(gone), "recorded snapshot")+" gone from the repository",
-			append(gone, removedHint)...)
+			plural(len(removed), "recorded snapshot")+" gone from the repository",
+			append(details, removedHint)...)
 
 		return nil
 	}
@@ -201,7 +165,8 @@ func record(
 		return fmt.Errorf("app: record: new record: %w", err)
 	}
 
-	// store the entry before any witness sees a checkpoint that covers it
+	// entry and log-signed checkpoint go to the storage before any witness
+	// sees them. That way an honest storage always has the newest checkpoint
 	if err := l.Append(entry); err != nil {
 		return fmt.Errorf("app: record: %w", err)
 	}
@@ -218,45 +183,52 @@ func record(
 		return fmt.Errorf("app: record: %w", err)
 	}
 
-	outs := wc.Collect(
-		ctx,
-		ws,
-		witness.Request{Signed: signed, Size: size, OldSize: n, Proof: proofTo(l, size)},
-		cfg.Quorum,
-	)
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("app: record: entry %d is stored but not witnessed, run record again: %w", size-1, err)
-	}
-
-	r.Witnesses = statuses(outs, size)
-	debugOutcomes("record", outs)
-	judge(r, outs, size, size, true)
-	cosigs := witness.Cosigned(outs)
-	if len(cosigs) < cfg.Quorum {
-		r.Add(
-			Alarm,
-			"quorum",
-			fmt.Sprintf(
-				"%d of %d witnesses cosigned size %d, quorum is %d; the record stays pending, run snapwitness record again",
-				len(cosigs),
-				len(ws),
-				size,
-				cfg.Quorum,
-			),
-		)
-		// keep the old checkpoint. If there's none yet, store this one anyway:
-		// the next run needs a signed size to start from, and audit reports the
-		// missing quorum
-		if cp != nil {
-			return nil
-		}
-	}
-
-	if err := l.WriteCheckpoint(wlog.Attach(signed, cosigs)); err != nil {
+	if err := l.WriteCheckpoint(signed); err != nil {
 		return fmt.Errorf("app: record: %w", err)
 	}
 
 	n = size
+
+	outs = wc.Collect(
+		ctx,
+		ws,
+		witness.Request{Signed: signed, Size: size, OldSize: cp.Size, Proof: proofTo(l, size)},
+		cfg.Quorum,
+	)
+	r.Witnesses = statuses(outs, size)
+	debugOutcomes("record", outs)
+	judge(r, outs, size, ctx.Err(), warned)
+	// Keep every cosignature that came back, even after an interrupt
+	cosigs := witness.Cosigned(outs)
+	if err := l.WriteCheckpoint(wlog.Attach(signed, cosigs)); err != nil {
+		return fmt.Errorf("app: record: %w", err)
+	}
+
+	if len(cosigs) >= cfg.Quorum {
+		return nil
+	}
+
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf(
+			"app: record: checkpoint %d is saved with %d of %d cosignatures, run snapwitness record again: %w",
+			size,
+			len(cosigs),
+			cfg.Quorum,
+			err,
+		)
+	}
+
+	r.Add(
+		Alarm,
+		"quorum",
+		fmt.Sprintf(
+			"%d of %d witnesses cosigned size %d, quorum is %d: the checkpoint is saved; run snapwitness record or audit again when the witnesses are back",
+			len(cosigs),
+			len(ws),
+			size,
+			cfg.Quorum,
+		),
+	)
 
 	return nil
 }
@@ -279,26 +251,6 @@ func loadSigner(cfg *config.Config, logKey note.Verifier) (note.Signer, error) {
 	}
 
 	return s, nil
-}
-
-// lost lists "<time> <id>" for each ID of the states that isn't in ids,
-// sorted by ID. The time is when the ID entered the log.
-func lost(ids []string, states ...*state.State) []string {
-	gone := map[string]state.Seen{}
-
-	for _, s := range states {
-		_, removed := state.Diff(s.IDs, ids)
-		for _, id := range removed {
-			gone[id] = s.IDs[id]
-		}
-	}
-
-	out := make([]string, 0, len(gone))
-	for _, id := range slices.Sorted(maps.Keys(gone)) {
-		out = append(out, gone[id].Time.Format(state.TimeFormat)+" "+id)
-	}
-
-	return out
 }
 
 // toolName returns the program version of the newest snapshot, or plain

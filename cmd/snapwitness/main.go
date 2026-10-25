@@ -137,7 +137,11 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	var cfgPaths listFlag
 	fs.Var(&cfgPaths, "c", "config `file`; repeat to audit several (default snapwitness.conf)")
 	offline := fs.Bool("offline", false, "do not ask the witnesses, check the stored cosignatures only")
-	workers := fs.Int("workers", 0, "files re-hashed at once (default GOMAXPROCS)")
+	workers := fs.Int(
+		"workers",
+		0,
+		"files re-hashed at once for each config; configs run in parallel (default GOMAXPROCS)",
+	)
 	timeout := fs.Duration("timeout", 2*time.Minute, "limit for each audit")
 	asJSON := fs.Bool("json", false, "write the reports as JSON")
 
