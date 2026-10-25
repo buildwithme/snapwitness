@@ -29,6 +29,9 @@ import (
 // run otherwise.
 const witnessTimeout = 30 * time.Second
 
+// defaultConfig is the config file when there's no -c.
+const defaultConfig = "snapwitness.conf"
+
 const usage = `usage:
   snapwitness init   -c snapwitness.conf -name NAME -repo DIR -log DIR -witness VKEY=URL [-witness ...] -quorum N [-maxage 26h]
   snapwitness record -c snapwitness.conf [-restic restic] [-accept-removed] [-json]
@@ -72,7 +75,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 func runInit(args []string, stdout, stderr io.Writer) int {
 	fs, verbose := newFlags("init", stderr)
-	cfgPath := fs.String("c", "snapwitness.conf", "config file to create")
+	cfgPath := fs.String("c", defaultConfig, "config file to create")
 	name := fs.String("name", "", "label inside the log origin: a-z, 0-9 and -")
 	repo := fs.String("repo", "", "restic repository `dir`")
 	logDir := fs.String("log", "", "log `dir`, on the same storage as the repository")
@@ -101,8 +104,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 		MaxAge:     *maxAge,
 	}, stdout)
 	if err != nil {
-		printf(stderr, "snapwitness: %v\n", err)
-		return app.ExitError
+		return fail(stderr, err)
 	}
 
 	return app.ExitOK
@@ -110,7 +112,7 @@ func runInit(args []string, stdout, stderr io.Writer) int {
 
 func runRecord(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	fs, verbose := newFlags("record", stderr)
-	cfgPath := fs.String("c", "snapwitness.conf", "config file")
+	cfgPath := fs.String("c", defaultConfig, "config file")
 	bin := fs.String("restic", "", "restic binary (default $RESTIC_BIN, else restic)")
 	accept := fs.Bool("accept-removed", false, "record removed snapshots as intended")
 	asJSON := fs.Bool("json", false, "write the report as JSON")
@@ -121,8 +123,7 @@ func runRecord(ctx context.Context, args []string, stdout, stderr io.Writer) int
 
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		printf(stderr, "snapwitness: %v\n", err)
-		return app.ExitError
+		return fail(stderr, err)
 	}
 
 	src := &restic.CLI{Bin: cmp.Or(*bin, os.Getenv("RESTIC_BIN"), "restic"), Repo: cfg.Repo}
@@ -150,7 +151,7 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	}
 
 	if len(cfgPaths) == 0 {
-		cfgPaths = listFlag{"snapwitness.conf"}
+		cfgPaths = listFlag{defaultConfig}
 	}
 
 	// worst code wins: alarm (3), then error (1), then ok (0)
@@ -161,9 +162,7 @@ func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 	for _, p := range cfgPaths {
 		cfg, err := config.Load(p)
 		if err != nil {
-			printf(stderr, "snapwitness: %v\n", err)
-
-			code = max(code, app.ExitError)
+			code = max(code, fail(stderr, err))
 
 			continue
 		}
@@ -229,6 +228,12 @@ func write(r *app.Report, asJSON bool, stdout, stderr io.Writer) int {
 	}
 
 	return app.ExitOK
+}
+
+func fail(stderr io.Writer, err error) int {
+	printf(stderr, "snapwitness: %v\n", err)
+
+	return app.ExitError
 }
 
 func printf(w io.Writer, format string, args ...any) {
