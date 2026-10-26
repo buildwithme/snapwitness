@@ -94,9 +94,19 @@ for i in 1 2; do
 	SSH_AUTH_SOCK=lw/agent.sock ssh-add -q "lw/w$i"
 done
 
+# Run a command without any RESTIC_* variable (and without the password).
+# The auditor and the witnesses run like this. The list is built at call time.
+no_restic() {
+	local unset_args=(-u RESTIC_PASSWORD -u RESTIC_REPOSITORY -u RESTIC_PASSWORD_FILE) v
+	for v in $(compgen -e); do
+		case $v in RESTIC_*) unset_args+=(-u "$v") ;; esac
+	done
+	env "${unset_args[@]}" "$@"
+}
+
 start_witness() { # index port
 	fp=$(ssh-keygen -lf "lw/w$1.pub" | awk '{print $2}')
-	"$BIN/litewitness" -db "lw/w$1.db" -name "witness-$1.lw.example" -key "$fp" \
+	no_restic "$BIN/litewitness" -db "lw/w$1.db" -name "witness-$1.lw.example" -key "$fp" \
 		-ssh-agent lw/agent.sock -listen "127.0.0.1:$2" 2>"lw/w$1.log" &
 }
 vkey_of() { # index
@@ -145,12 +155,7 @@ start_witnesses
 echo "--- snapwitness.conf"
 cat snapwitness.conf
 
-# the auditor gets no RESTIC_* variable at all, no password either
-UNSET=(-u RESTIC_PASSWORD -u RESTIC_REPOSITORY -u RESTIC_PASSWORD_FILE)
-for v in $(compgen -e); do
-	case $v in RESTIC_*) UNSET+=(-u "$v") ;; esac
-done
-auditor() { env "${UNSET[@]}" "$@"; }
+auditor() { no_restic "$@"; }
 
 ROWS=''
 FAILED=0
