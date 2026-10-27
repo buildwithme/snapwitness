@@ -94,19 +94,22 @@ for i in 1 2; do
 	SSH_AUTH_SOCK=lw/agent.sock ssh-add -q "lw/w$i"
 done
 
-# Run a command without any RESTIC_* variable (and without the password).
-# The auditor and the witnesses run like this. The list is built at call time.
-no_restic() {
-	local unset_args=(-u RESTIC_PASSWORD -u RESTIC_REPOSITORY -u RESTIC_PASSWORD_FILE) v
+# Builds UNSET: one env -u per RESTIC_* variable, for the auditor and the
+# witnesses. Callers run env themselves because $! of a function started in
+# the background points at the subshell.
+UNSET=()
+restic_unset_args() {
+	local v
+	UNSET=(-u RESTIC_PASSWORD -u RESTIC_REPOSITORY -u RESTIC_PASSWORD_FILE)
 	for v in $(compgen -e); do
-		case $v in RESTIC_*) unset_args+=(-u "$v") ;; esac
+		case $v in RESTIC_*) UNSET+=(-u "$v") ;; esac
 	done
-	env "${unset_args[@]}" "$@"
 }
 
 start_witness() { # index port
 	fp=$(ssh-keygen -lf "lw/w$1.pub" | awk '{print $2}')
-	no_restic "$BIN/litewitness" -db "lw/w$1.db" -name "witness-$1.lw.example" -key "$fp" \
+	restic_unset_args
+	env "${UNSET[@]}" "$BIN/litewitness" -db "lw/w$1.db" -name "witness-$1.lw.example" -key "$fp" \
 		-ssh-agent lw/agent.sock -listen "127.0.0.1:$2" 2>"lw/w$1.log" &
 }
 vkey_of() { # index
@@ -128,7 +131,10 @@ stop_witnesses() {
 	wait "$LW1" "$LW2" 2>/dev/null || true
 	LW1=''
 	LW2=''
+	wait_for "port $PORT1 to close" port_closed $PORT1
+	wait_for "port $PORT2 to close" port_closed $PORT2
 }
+port_closed() { ! curl -s -o /dev/null "http://127.0.0.1:$1/"; }
 start_witnesses
 echo "witness-1 $V1"
 echo "witness-2 $V2"
@@ -155,7 +161,10 @@ start_witnesses
 echo "--- snapwitness.conf"
 cat snapwitness.conf
 
-auditor() { no_restic "$@"; }
+auditor() {
+	restic_unset_args
+	env "${UNSET[@]}" "$@"
+}
 
 ROWS=''
 FAILED=0
