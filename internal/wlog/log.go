@@ -6,6 +6,7 @@
 package wlog
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -48,20 +49,35 @@ var (
 // repository.
 type Log struct {
 	dir     string
+	dirInfo fs.FileInfo // what Open read; every write must go to this same dir
+	file    fs.FileInfo
+	stored  int64 // entries file size: read by Open plus written by Append
 	entries [][]byte
 	hashes  []tlog.Hash // from tlog.StoredHashes, in storage order
 }
 
 // Create makes the log directory and an empty entries file. It fails if the
-// entries file is already there and never truncates a log.
+// entries file is already there, or if dir is a symlink. It never truncates
+// a log.
 func Create(dir string) error {
 	//nolint:gosec // the auditor may read the log as another user
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("wlog: create: %w", err)
 	}
 
-	//nolint:gosec // the auditor may read the log as another user
-	f, err := os.OpenFile(filepath.Join(dir, EntriesFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	info, err := lstatDir(dir)
+	if err != nil {
+		return fmt.Errorf("wlog: create: %w", err)
+	}
+
+	root, err := openRoot(dir, info)
+	if err != nil {
+		return fmt.Errorf("wlog: create: %w", err)
+	}
+
+	defer func() { _ = root.Close() }()
+
+	f, err := root.OpenFile(EntriesFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return fmt.Errorf("wlog: create: %w", err)
 	}
@@ -70,7 +86,7 @@ func Create(dir string) error {
 		return fmt.Errorf("wlog: create: %w", err)
 	}
 
-	if err := syncDir(dir); err != nil {
+	if err := syncDir(root); err != nil {
 		return fmt.Errorf("wlog: create: %w", err)
 	}
 
@@ -78,10 +94,20 @@ func Create(dir string) error {
 }
 
 // Open reads every entry in dir and recomputes the RFC 6962 hashes in
-// memory. We never take a hash from the storage. ErrNoLog means the entries
-// file is missing.
+// memory. We never take a hash from the storage. ErrNoLog means the
+// directory or the entries file is missing.
 func Open(dir string) (*Log, error) {
-	data, err := readFile(filepath.Join(dir, EntriesFile), maxEntriesSize)
+	dirInfo, err := lstatDir(dir)
+
+	var (
+		data []byte
+		file fs.FileInfo
+	)
+
+	if err == nil {
+		data, file, err = readFile(filepath.Join(dir, EntriesFile), maxEntriesSize)
+	}
+
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNoLog
 	}
@@ -90,8 +116,7 @@ func Open(dir string) (*Log, error) {
 		return nil, fmt.Errorf("wlog: open: %w", err)
 	}
 
-	l := &Log{dir: dir}
-
+	l := &Log{dir: dir, dirInfo: dirInfo, file: file, stored: int64(len(data))}
 	for off := 0; off < len(data); {
 		// the file is untrusted and a torn write leaves a short tail. Check the
 		// length against the limit and the bytes left first
@@ -165,10 +190,11 @@ func (l *Log) Append(entry []byte) error {
 	binary.BigEndian.PutUint32(frame, uint32(len(entry)))
 	copy(frame[frameHeader:], entry)
 
-	if err := appendFrame(filepath.Join(l.dir, EntriesFile), frame); err != nil {
+	if err := l.appendFrame(frame); err != nil {
 		return fmt.Errorf("wlog: append: %w", err)
 	}
 
+	l.stored += int64(len(frame))
 	l.entries = append(l.entries, frame[frameHeader:])
 	l.hashes = append(l.hashes, hs...)
 
@@ -214,7 +240,7 @@ func (l *Log) Consistency(from, to int64) ([]tlog.Hash, error) {
 // ErrNoCheckpoint. A checkpoint over 1 MiB or one that isn't a regular file
 // is an error.
 func (l *Log) ReadCheckpoint() ([]byte, error) {
-	b, err := readFile(filepath.Join(l.dir, CheckpointFile), maxCheckpointSize)
+	b, _, err := readFile(filepath.Join(l.dir, CheckpointFile), maxCheckpointSize)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, ErrNoCheckpoint
 	}
@@ -227,14 +253,24 @@ func (l *Log) ReadCheckpoint() ([]byte, error) {
 }
 
 // WriteCheckpoint replaces the stored checkpoint with signed, by temp file
-// and rename. After a crash there's either the old one or the new one.
+// and rename. After a crash there's either the old one or the new one. It
+// only writes into the directory Open read: a symlink planted by the storage
+// can't send the write somewhere else.
 func (l *Log) WriteCheckpoint(signed []byte) error {
-	f, err := os.CreateTemp(l.dir, CheckpointFile+".tmp-*")
+	root, err := openRoot(l.dir, l.dirInfo)
 	if err != nil {
 		return fmt.Errorf("wlog: write checkpoint: %w", err)
 	}
 
-	tmp := f.Name()
+	defer func() { _ = root.Close() }()
+	// fresh random name, we don't want to reuse anything the storage put
+	// there in advance
+	tmp := CheckpointFile + ".tmp-" + rand.Text()
+
+	f, err := root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("wlog: write checkpoint: %w", err)
+	}
 
 	err = f.Chmod(0o644)
 	if err == nil {
@@ -250,15 +286,15 @@ func (l *Log) WriteCheckpoint(signed []byte) error {
 	}
 
 	if err == nil {
-		err = os.Rename(tmp, filepath.Join(l.dir, CheckpointFile))
+		err = root.Rename(tmp, CheckpointFile)
 	}
 
 	if err != nil {
-		_ = os.Remove(tmp)
+		_ = root.Remove(tmp)
 		return fmt.Errorf("wlog: write checkpoint: %w", err)
 	}
 
-	if err := syncDir(l.dir); err != nil {
+	if err := syncDir(root); err != nil {
 		return fmt.Errorf("wlog: write checkpoint: %w", err)
 	}
 
@@ -281,16 +317,28 @@ func (l *Log) reader() tlog.HashReader {
 	})
 }
 
-// appendFrame writes one frame at the end of the entries file and syncs it.
-// On failure it truncates the file back to its old size. A later append must
-// not land behind a torn frame.
-func appendFrame(path string, frame []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+// appendFrame appends one frame to the entries file and syncs it, but only
+// while that file is still the one Open read. A frame written to a file the
+// storage swapped in would get cosigned and never reach the log. A failed
+// write is truncated away. A later append must not land behind a torn frame.
+func (l *Log) appendFrame(frame []byte) error {
+	root, err := openRoot(l.dir, l.dirInfo)
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = root.Close() }()
+	// O_NONBLOCK: a fifo must not block the open, the Stat below rejects it
+	f, err := root.OpenFile(EntriesFile, os.O_WRONLY|os.O_APPEND|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return err
 	}
 
 	st, err := f.Stat()
+	if err == nil && (!st.Mode().IsRegular() || !os.SameFile(l.file, st) || st.Size() != l.stored) {
+		err = errors.New("entries changed on the storage since it was read")
+	}
+
 	if err == nil {
 		if _, err = f.Write(frame); err == nil {
 			err = f.Sync()
@@ -308,47 +356,87 @@ func appendFrame(path string, frame []byte) error {
 	return err
 }
 
-// readFile reads a regular file of at most limit bytes through one handle.
-// It never follows a symlink or blocks on a fifo. All checks run on the
-// handle: the storage can't swap the file between check and read.
-func readFile(path string, limit int64) ([]byte, error) {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+// lstatDir fails unless dir is a directory itself. A symlink to one isn't
+// enough.
+func lstatDir(dir string) (fs.FileInfo, error) {
+	// Drop a trailing slash, which would make Lstat follow a symlink
+	st, err := os.Lstat(filepath.Clean(dir))
 	if err != nil {
 		return nil, err
+	}
+
+	if !st.IsDir() {
+		return nil, fmt.Errorf("%s is not a directory", dir)
+	}
+
+	return st, nil
+}
+
+// openRoot opens dir as an os.Root and checks it's still the directory
+// described by want. Files reached through the root can't escape it by a
+// symlink. The check also catches a dir the storage swapped for a symlink
+// since it was read.
+func openRoot(dir string, want fs.FileInfo) (*os.Root, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	st, err := root.Stat(".")
+	if err == nil && !os.SameFile(want, st) {
+		err = fmt.Errorf("log directory %s changed on the storage since it was read", dir)
+	}
+
+	if err != nil {
+		_ = root.Close()
+		return nil, err
+	}
+
+	return root, nil
+}
+
+// readFile reads a regular file of at most limit bytes through one handle,
+// and returns it with the handle's info. It never follows a symlink or blocks
+// on a fifo. All checks run on the handle: the storage can't swap the file
+// between check and read.
+func readFile(path string, limit int64) ([]byte, fs.FileInfo, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	defer func() { _ = f.Close() }()
 
 	st, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("%s is not a regular file", path)
+		return nil, nil, fmt.Errorf("%s is not a regular file", path)
 	}
 
 	if st.Size() > limit {
-		return nil, fmt.Errorf("%s is over %d bytes", path, limit)
+		return nil, nil, fmt.Errorf("%s is over %d bytes", path, limit)
 	}
 
 	// Read one byte past the limit to catch a file that grew after the Stat
 	b, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if int64(len(b)) > limit {
-		return nil, fmt.Errorf("%s is over %d bytes", path, limit)
+		return nil, nil, fmt.Errorf("%s is over %d bytes", path, limit)
 	}
 
-	return b, nil
+	return b, st, nil
 }
 
-// syncDir flushes the directory itself. Without it a new or renamed file
-// may not survive a crash.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
+// syncDir flushes the root directory itself. Without it a new or renamed
+// file may not survive a crash.
+func syncDir(root *os.Root) error {
+	d, err := root.Open(".")
 	if err != nil {
 		return err
 	}

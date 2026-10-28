@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -476,6 +477,218 @@ func TestWriteCheckpointRemovesTemp(t *testing.T) {
 	if _, err := l.ReadCheckpoint(); err == nil || errors.Is(err, ErrNoCheckpoint) {
 		t.Errorf("read a directory: got %v, want a not a regular file error", err)
 	}
+}
+
+func TestAppendRejectsSwappedEntries(t *testing.T) {
+	// Write a copy of the entries file, the same size, at path
+	copyTo := func(t *testing.T, dir, path string) {
+		t.Helper()
+
+		b, err := os.ReadFile(filepath.Join(dir, EntriesFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.WriteFile(path, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(t *testing.T, dir, target string) {
+		t.Helper()
+
+		if err := os.Remove(filepath.Join(dir, EntriesFile)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Symlink(target, filepath.Join(dir, EntriesFile)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tests := []struct {
+		name string
+		swap func(t *testing.T, dir, outside string)
+		want string
+	}{
+		{"symlink to a file outside the dir", func(t *testing.T, dir, outside string) {
+			copyTo(t, dir, outside)
+			link(t, dir, outside)
+		}, ""},
+		{"symlink to a file in the dir", func(t *testing.T, dir, _ string) {
+			copyTo(t, dir, filepath.Join(dir, "copy"))
+			link(t, dir, "copy")
+		}, "entries changed on the storage"},
+		{"another regular file", func(t *testing.T, dir, _ string) {
+			copyTo(t, dir, filepath.Join(dir, "copy"))
+
+			if err := os.Rename(filepath.Join(dir, "copy"), filepath.Join(dir, EntriesFile)); err != nil {
+				t.Fatal(err)
+			}
+		}, "entries changed on the storage"},
+		{"grown on the storage", func(t *testing.T, dir, _ string) {
+			f, err := os.OpenFile(filepath.Join(dir, EntriesFile), os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := f.Write(encodeFrame([]byte("planted"))); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}, "entries changed on the storage"},
+		{"fifo", func(t *testing.T, dir, _ string) {
+			if err := os.Remove(filepath.Join(dir, EntriesFile)); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := syscall.Mkfifo(filepath.Join(dir, EntriesFile), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			l := newLog(t, []byte("first"))
+			outside := filepath.Join(t.TempDir(), "outside")
+			tt.swap(t, l.Dir(), outside)
+			before := contents(t, l.Dir(), outside)
+			// Append in a goroutine so a blocking open on the fifo fails the
+			// test instead of hanging it
+			done := make(chan error, 1)
+			go func() { done <- l.Append([]byte("second")) }()
+
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("append blocked, want an error")
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("got %v, want an error with %q", err, tt.want)
+			}
+
+			if l.Size() != 1 {
+				t.Errorf("got size %d, want 1", l.Size())
+			}
+
+			if after := contents(t, l.Dir(), outside); !maps.Equal(after, before) {
+				t.Errorf("got files %q after the append, want %q", after, before)
+			}
+		})
+	}
+}
+
+func TestWritesRejectSwappedDir(t *testing.T) {
+	l := newLog(t, []byte("first"))
+	if err := l.WriteCheckpoint([]byte("old\n")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Move the log away and put a symlink to a dir outside the storage in its
+	// place
+	moved := l.Dir() + ".moved"
+	if err := os.Rename(l.Dir(), moved); err != nil {
+		t.Fatal(err)
+	}
+
+	outside := t.TempDir()
+
+	b, err := os.ReadFile(filepath.Join(moved, EntriesFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(outside, EntriesFile), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Symlink(outside, l.Dir()); err != nil {
+		t.Fatal(err)
+	}
+
+	before := contents(t, outside)
+
+	const want = "changed on the storage"
+	if err := l.WriteCheckpoint([]byte("new\n")); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("write checkpoint: got %v, want an error with %q", err, want)
+	}
+
+	if err := l.Append([]byte("second")); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("append: got %v, want an error with %q", err, want)
+	}
+
+	if after := contents(t, outside); !maps.Equal(after, before) {
+		t.Errorf("got files %q outside, want %q", after, before)
+	}
+
+	if got := contents(t, moved)[filepath.Join(moved, CheckpointFile)]; got != "old\n" {
+		t.Errorf("got checkpoint %q in the log, want %q", got, "old\n")
+	}
+}
+
+func TestSymlinkedDir(t *testing.T) {
+	target := newLog(t, []byte("first")).Dir()
+
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dir := range []string{link, link + "/"} {
+		if _, err := Open(dir); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+			t.Errorf("open %s: got %v, want a not a directory error", dir, err)
+		}
+	}
+
+	empty := t.TempDir()
+
+	link = filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(empty, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Create(link); err == nil || !strings.Contains(err.Error(), "is not a directory") {
+		t.Errorf("create: got %v, want a not a directory error", err)
+	}
+
+	assertFiles(t, empty)
+}
+
+// contents maps path to bytes for every regular file in dir, plus the extra
+// paths that are regular files.
+func contents(t *testing.T, dir string, extra ...string) map[string]string {
+	t.Helper()
+
+	des, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	paths := slices.Clone(extra)
+	for _, de := range des {
+		paths = append(paths, filepath.Join(dir, de.Name()))
+	}
+
+	out := map[string]string{}
+
+	for _, p := range paths {
+		if st, err := os.Lstat(p); err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		out[p] = string(b)
+	}
+
+	return out
 }
 
 func assertFiles(t *testing.T, dir string, want ...string) {
