@@ -26,7 +26,7 @@ const MinFileSize = 32 // 16-byte IV + 16-byte MAC
 type Listing struct {
 	IDs      []string // sorted: valid names whose SHA-256 matches the content
 	Mismatch []string
-	Foreign  []string // not 64 lowercase hex
+	Foreign  []string // not 64 lowercase hex, or not a regular file
 	TooShort []string
 	Files    int
 	Bytes    int64
