@@ -6,7 +6,7 @@ RUMDL := uvx rumdl@0.2.78
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build test bench lint fmt demo clean
+.PHONY: help build test bench cover lint fmt demo clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-z]+:.*## / {printf "  %-8s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -19,6 +19,10 @@ test: ## Run all tests with the race detector
 
 bench: ## Run the benchmarks
 	go test -run '^$$' -bench . ./...
+
+cover: ## Write coverage.out and print the coverage of each function
+	go test -coverprofile=coverage.out ./...
+	go tool cover -func=coverage.out
 
 lint: ## Lint the Go, shell and Markdown files
 	$(GOLANGCI) run
