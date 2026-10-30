@@ -114,6 +114,30 @@ func TestAppendOpenRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOffset(t *testing.T) {
+	l := newLog(t)
+	want := []int64{0}
+
+	for _, e := range testEntries(3) {
+		if err := l.Append(e); err != nil {
+			t.Fatal(err)
+		}
+
+		fi, err := os.Stat(filepath.Join(l.Dir(), EntriesFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		want = append(want, fi.Size())
+	}
+
+	for n, w := range want {
+		if got := l.Offset(int64(n)); got != w {
+			t.Errorf("Offset(%d): got %d, want %d", n, got, w)
+		}
+	}
+}
+
 func TestEntriesCannotOverwrite(t *testing.T) {
 	l := newLog(t, testEntries(3)...)
 

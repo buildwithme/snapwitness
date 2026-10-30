@@ -173,6 +173,17 @@ func (l *Log) Entries(n int64) [][]byte {
 	return l.entries[:n:n]
 }
 
+// Offset returns the size in bytes of the first n frames. Truncate the
+// entries file to that and exactly n entries are left.
+func (l *Log) Offset(n int64) int64 {
+	var off int64
+	for _, e := range l.Entries(n) {
+		off += frameHeader + int64(len(e))
+	}
+
+	return off
+}
+
 // Append writes one entry at the end of the log and syncs it to disk before
 // it returns. That way a checkpoint only ever covers stored entries.
 func (l *Log) Append(entry []byte) error {

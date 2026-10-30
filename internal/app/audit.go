@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -419,7 +420,12 @@ func tail(r *Report, l *wlog.Log, n int64) bool {
 	r.Add(
 		Alarm,
 		"tampered",
-		entries+" past the checkpoint that no witness has seen: the storage added them, or a record run stopped between its append and its checkpoint write; see LIMITATIONS.md",
+		entries+" past the checkpoint that no witness has seen: the storage added them, or a record run stopped between its append and its checkpoint write",
+		fmt.Sprintf(
+			"to drop them by hand: truncate -s %d %q (see LIMITATIONS.md)",
+			l.Offset(n),
+			filepath.Join(l.Dir(), wlog.EntriesFile),
+		),
 	)
 
 	return true

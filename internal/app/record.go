@@ -33,7 +33,7 @@ type RecordOptions struct {
 // removedHint tells the user how to record a removal made on purpose.
 //
 // TODO: signed removals. -accept-removed takes everything for now.
-const removedHint = "use -accept-removed only if you removed them on purpose; there is no admin key yet (see LIMITATIONS.md)"
+const removedHint = "use -accept-removed only if you removed them on purpose; there is no separate admin key for removals (see LIMITATIONS.md)"
 
 // Record runs after each backup. It appends a state record and gets the new
 // checkpoint cosigned by a quorum. It stops first if a witness has seen a

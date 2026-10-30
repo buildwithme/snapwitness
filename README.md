@@ -27,7 +27,7 @@ make demo
 
 The demo runs five cases against real restic and two real witnesses (litewitness): a clean repository, a deleted snapshot, a prune nobody approved, a known gap and a rollback. You see every command with its output, and at the end a table with the results.
 
-You need Go, `ssh-agent`, `ssh-keygen`, `curl` and restic (from `$RESTIC_BIN` or `PATH`). The script is [demo/demo.sh](demo/demo.sh).
+You need Go, `ssh-agent`, `ssh-add`, `ssh-keygen`, `curl`, restic (from `$RESTIC_BIN` or `PATH`) and `perl` if your bash has no `EPOCHREALTIME`. It also needs network access to download litewitness and the Go toolchain litewitness needs. The script is [demo/demo.sh](demo/demo.sh).
 
 ## Commands
 
@@ -57,7 +57,7 @@ The details, formats and diagrams are in [docs/design.md](docs/design.md).
 
 ## Limits
 
-A snapshot that was deleted before it was ever recorded is invisible to SnapWitness. It trusts the first config you give it, and there's no key for authorised removals yet. [LIMITATIONS.md](LIMITATIONS.md) has the full list.
+A snapshot that was deleted before it was ever recorded is invisible to SnapWitness. It trusts the first config you give it, and there's no separate key for authorised removals. [LIMITATIONS.md](LIMITATIONS.md) has the full list.
 
 ## Security
 

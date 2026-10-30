@@ -204,7 +204,7 @@ The listing only opens regular files and doesn't follow symlinks. Anything else 
 
 I didn't want to run a server for this. The log is a plain file next to the repository and there's nothing extra to operate. The storage isn't trusted anyway, and every claim in it is checked against the log key and the witnesses.
 
-The log is hand-written. Tessera felt like too much for this, the MVP only needs an append-only list of a few thousand records with proofs, and `golang.org/x/mod/sumdb/tlog` gives the RFC 6962 hashes and proofs without an extra dependency.
+The log is hand-written. Tessera felt like too much for this, the prototype only needs an append-only list of a few thousand records with proofs, and `golang.org/x/mod/sumdb/tlog` gives the RFC 6962 hashes and proofs without an extra dependency.
 
 The witnesses are in the design from the start. A signed log on the same storage proves nothing against a rollback, because the operator can restore the log together with the repository. Only the witnesses remember the newest size.
 

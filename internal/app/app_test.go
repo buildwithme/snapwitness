@@ -632,14 +632,25 @@ func TestTailPastCheckpoint(t *testing.T) {
 		Set:     state.SetHash(e.ids[1:]),
 		Removed: []string{e.ids[0]},
 	}
+
+	before, err := os.Stat(e.entries())
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	e.appendFrames(slipped.Marshal())
 	e.remove(e.ids[0])
 
 	r := e.record(app.RecordOptions{AcceptRemoved: true})
 	expect(t, "record", r, app.ExitAlarm, "ALARM tampered")
+	f := finding(t, r, "tampered")
+	if !strings.Contains(f.Message, "1 log entry past the checkpoint") {
+		t.Errorf("got message %q, want it to count the entry past the checkpoint", f.Message)
+	}
 
-	if msg := finding(t, r, "tampered").Message; !strings.Contains(msg, "1 log entry past the checkpoint") {
-		t.Errorf("got message %q, want it to count the entry past the checkpoint", msg)
+	// The repair hint must cut exactly the slipped frame
+	if d := strings.Join(f.Details, "\n"); !strings.Contains(d, fmt.Sprintf("truncate -s %d ", before.Size())) {
+		t.Errorf("got details %q, want a truncate to %d bytes", d, before.Size())
 	}
 
 	e.wantSizes("after the refused record", 4, 3)
