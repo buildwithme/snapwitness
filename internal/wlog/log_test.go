@@ -131,9 +131,19 @@ func TestOffset(t *testing.T) {
 		want = append(want, fi.Size())
 	}
 
+	// Audit and record call Offset on a log read back by Open
+	re, err := Open(l.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	for n, w := range want {
 		if got := l.Offset(int64(n)); got != w {
 			t.Errorf("Offset(%d): got %d, want %d", n, got, w)
+		}
+
+		if got := re.Offset(int64(n)); got != w {
+			t.Errorf("Offset(%d) after Open: got %d, want %d", n, got, w)
 		}
 	}
 }

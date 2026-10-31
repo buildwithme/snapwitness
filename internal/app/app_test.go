@@ -648,14 +648,48 @@ func TestTailPastCheckpoint(t *testing.T) {
 		t.Errorf("got message %q, want it to count the entry past the checkpoint", f.Message)
 	}
 
-	// The repair hint must cut exactly the slipped frame
-	if d := strings.Join(f.Details, "\n"); !strings.Contains(d, fmt.Sprintf("truncate -s %d ", before.Size())) {
-		t.Errorf("got details %q, want a truncate to %d bytes", d, before.Size())
-	}
-
 	e.wantSizes("after the refused record", 4, 3)
 	e.wantWitnesses("after the refused record", 3)
-	expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM tampered", "ALARM deleted")
+	a := e.audit(app.AuditOptions{})
+	expect(t, "audit", a, app.ExitAlarm, "ALARM tampered", "ALARM deleted")
+
+	// every witness is at size 3. Record and audit should both print the
+	// command that cuts exactly the slipped frame
+	p := "'" + e.entries() + "'"
+	want := fmt.Sprintf("[ -f %s ] && [ ! -L %s ] && truncate -c -s %d %s", p, p, before.Size(), p)
+
+	for _, rep := range []*app.Report{r, a} {
+		if d := strings.Join(finding(t, rep, "tampered").Details, "\n"); !strings.Contains(d, want) {
+			t.Errorf("%s: got details %q, want %q", rep.Command, d, want)
+		}
+	}
+
+	// offline audit can't know what the witnesses saw
+	offline := e.audit(app.AuditOptions{Offline: true})
+	if d := strings.Join(finding(t, offline, "tampered").Details, "\n"); strings.Contains(d, "truncate") {
+		t.Errorf("offline audit: got details %q, want no truncate command", d)
+	}
+
+	if err := os.Truncate(e.entries(), before.Size()); err != nil {
+		t.Fatal(err)
+	}
+
+	expect(t, "record after the repair", e.record(app.RecordOptions{AcceptRemoved: true}), app.ExitOK)
+	e.wantSizes("after the repair", 4, 4)
+	expect(t, "audit after the repair", e.audit(app.AuditOptions{}), app.ExitOK)
+}
+
+// wantKeepAdvice wants the tail alarm of each report to say keep the
+// entries. A witness that's ahead may have cosigned them.
+func wantKeepAdvice(t *testing.T, reports ...*app.Report) {
+	t.Helper()
+
+	for _, r := range reports {
+		d := strings.Join(finding(t, r, "tampered").Details, "\n")
+		if strings.Contains(d, "truncate") || !strings.Contains(d, "do not drop them") {
+			t.Errorf("%s: got details %q, want advice to keep the entries", r.Command, d)
+		}
+	}
 }
 
 func TestRollback(t *testing.T) {
@@ -706,8 +740,12 @@ func TestRollbackWithTail(t *testing.T) {
 		writeFile(t, e.checkpoint(), cp3)
 		e.remove(e.ids[3])
 
-		expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
-		expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		a := e.audit(app.AuditOptions{})
+		expect(t, "audit", a, app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+
+		r := e.record(app.RecordOptions{})
+		expect(t, "record", r, app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		wantKeepAdvice(t, a, r)
 		e.wantSizes("after the refused record", 4, 3)
 		e.wantWitnesses("after the refused record", 4)
 	})
@@ -720,8 +758,12 @@ func TestRollbackWithTail(t *testing.T) {
 		e.restore(p3)
 		e.appendFrames([]byte("junk frame one"), []byte("junk frame two"))
 
-		expect(t, "audit", e.audit(app.AuditOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
-		expect(t, "record", e.record(app.RecordOptions{}), app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		a := e.audit(app.AuditOptions{})
+		expect(t, "audit", a, app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+
+		r := e.record(app.RecordOptions{})
+		expect(t, "record", r, app.ExitAlarm, "ALARM rollback", "ALARM tampered")
+		wantKeepAdvice(t, a, r)
 		e.wantSizes("after the refused record", 5, 3)
 		e.wantWitnesses("after the refused record", 5)
 	})

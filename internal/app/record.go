@@ -97,7 +97,7 @@ func record(
 	warned := map[string]bool{}
 	rollback, fork := judge(r, outs, n, ctx.Err(), warned)
 	// Never sign entries past the checkpoint, because no witness has seen them
-	tampered := tail(r, l, n)
+	tampered := tail(r, l, n, rollback || fork, len(witness.Cosigned(outs)) == len(ws))
 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("app: record: %w", err)

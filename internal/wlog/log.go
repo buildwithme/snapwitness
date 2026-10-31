@@ -174,7 +174,8 @@ func (l *Log) Entries(n int64) [][]byte {
 }
 
 // Offset returns the size in bytes of the first n frames. Truncate the
-// entries file to that and exactly n entries are left.
+// entries file to that and exactly n entries are left. n is 0 to Size, as
+// for Entries.
 func (l *Log) Offset(n int64) int64 {
 	var off int64
 	for _, e := range l.Entries(n) {

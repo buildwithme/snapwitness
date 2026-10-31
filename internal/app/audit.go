@@ -63,7 +63,6 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 	}
 
 	n := v.Size
-	tail(r, l, n)
 
 	st, err := state.Replay(l.Entries(n))
 	if err != nil {
@@ -93,14 +92,18 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 	listErr := g.Wait()
 	ctxErr := ctx.Err()
 
+	var ahead bool
+
 	if opts.Offline {
 		r.Witnesses = stored(ws, v.Cosigs)
 	} else {
 		r.Witnesses = statuses(outs, n)
 		debugOutcomes("audit", outs)
-		judge(r, outs, n, ctxErr, map[string]bool{})
+		rollback, fork := judge(r, outs, n, ctxErr, map[string]bool{})
+		ahead = rollback || fork
 	}
 
+	tail(r, l, n, ahead, len(witness.Cosigned(outs)) == len(ws))
 	checkFresh(r, cfg, now, st, v.Cosigs, outs)
 
 	switch {
@@ -404,9 +407,10 @@ func checkStored(r *Report, l *wlog.Log, cp []byte, logKey note.Verifier, witnes
 }
 
 // tail raises a tampered alarm and returns true when the log has entries past
-// the checkpoint of size n. Either the storage added them or a record run
-// stopped between append and checkpoint write. Nothing may build on them.
-func tail(r *Report, l *wlog.Log, n int64) bool {
+// the checkpoint of size n. Nothing may build on those. We only show how to
+// drop them when allCosigned is set and ahead isn't, otherwise a witness may
+// have cosigned them.
+func tail(r *Report, l *wlog.Log, n int64, ahead, allCosigned bool) bool {
 	k := l.Size() - n
 	if k <= 0 {
 		return false
@@ -417,18 +421,38 @@ func tail(r *Report, l *wlog.Log, n int64) bool {
 		entries = "1 log entry"
 	}
 
+	var advice string
+
+	switch {
+	case ahead:
+		advice = "do not drop them: a witness has seen a larger or different log, so they may be records it cosigned (see LIMITATIONS.md)"
+	case !allCosigned:
+		advice = "do not drop them before an audit where every witness answers and none has seen them (see LIMITATIONS.md)"
+	default:
+		p := shellQuote(filepath.Join(l.Dir(), wlog.EntriesFile))
+		advice = fmt.Sprintf(
+			"every witness is at size %d; if a second audit shows this alarm again, drop them by hand: [ -f %s ] && [ ! -L %s ] && truncate -c -s %d %s (see LIMITATIONS.md)",
+			n,
+			p,
+			p,
+			l.Offset(n),
+			p,
+		)
+	}
+
 	r.Add(
 		Alarm,
 		"tampered",
-		entries+" past the checkpoint that no witness has seen: the storage added them, or a record run stopped between its append and its checkpoint write",
-		fmt.Sprintf(
-			"to drop them by hand: truncate -s %d %q (see LIMITATIONS.md)",
-			l.Offset(n),
-			filepath.Join(l.Dir(), wlog.EntriesFile),
-		),
+		entries+" past the checkpoint: the storage added them, or a record run stopped between its append and its checkpoint write",
+		advice,
 	)
 
 	return true
+}
+
+// shellQuote quotes s as one word for a POSIX shell.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // judge turns the witness answers for a checkpoint of size n into findings.
