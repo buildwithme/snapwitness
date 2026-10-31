@@ -20,6 +20,21 @@ die() {
 	exit 1
 }
 
+AGENT=''
+LW1=''
+LW2=''
+cleanup() {
+	# shellcheck disable=SC2086 # empty pids must vanish
+	kill $LW1 $LW2 $AGENT 2>/dev/null || true
+	# the witnesses keep writing into the work folder until they exit
+	# shellcheck disable=SC2086
+	[ -z "$LW1$LW2" ] || wait $LW1 $LW2 2>/dev/null || true
+	if [ "${DEMO_CLEAN:-}" = 1 ]; then
+		rm -rf "$WORK" "$BIN"
+	fi
+}
+trap cleanup EXIT
+
 for tool in go ssh-agent ssh-keygen ssh-add curl; do
 	command -v "$tool" >/dev/null || die "$tool not found in PATH"
 done
@@ -64,15 +79,6 @@ rm -rf "$WORK"
 mkdir -p "$WORK/lw"
 # relative paths from here on: macOS limits unix socket paths to 104 bytes
 cd "$WORK"
-
-AGENT=''
-LW1=''
-LW2=''
-cleanup() {
-	# shellcheck disable=SC2086 # empty pids must vanish
-	kill $LW1 $LW2 $AGENT 2>/dev/null || true
-}
-trap cleanup EXIT
 
 wait_for() { # what command...
 	what=$1

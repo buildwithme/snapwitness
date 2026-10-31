@@ -35,7 +35,7 @@ fmt: ## Format the Go, shell and Markdown files
 	$(SHFMT) -w $(SH)
 	$(RUMDL) fmt .
 
-demo: ## Run the 5-case demo with real restic and litewitness
+demo: ## Run the 5-case demo with real restic and litewitness (DEMO_CLEAN=1 deletes its files afterwards)
 	./demo/demo.sh
 
 clean: ## Remove the built binary and the demo work files

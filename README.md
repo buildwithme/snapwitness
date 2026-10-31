@@ -29,6 +29,8 @@ The demo runs five cases against real restic and two real witnesses (litewitness
 
 You need Go, `ssh-agent`, `ssh-add`, `ssh-keygen`, `curl`, restic (from `$RESTIC_BIN` or `PATH`) and `perl` if your bash has no `EPOCHREALTIME`. It also needs network access to download litewitness and the Go toolchain litewitness needs. The script is [demo/demo.sh](demo/demo.sh).
 
+The files it makes stay in `demo/.work` and `demo/.bin` for you to look at. `DEMO_CLEAN=1 make demo` deletes them at the end.
+
 ## Commands
 
 ```text
