@@ -11,6 +11,6 @@ SnapWitness is a prototype. It only detects problems, it doesn't stop or repair 
 - Only Linux and macOS are supported. The audit opens files with `O_NOFOLLOW` and `O_NONBLOCK`, and Windows has neither.
 - It's restic only. The auditor reads `snapshots/` from a local path, for example a mounted or synced copy, and can't read remote backends directly.
 - `record -accept-removed` is just a placeholder: it accepts every removal since the last record. There's no separate admin key and no signed "this removal is on purpose" entry. When a snapshot goes away, a `forget` or `prune` you didn't run looks the same as one you did.
-- The time in a state record comes from the client's clock. For freshness the audit uses the witness timestamps, because they are the only times that come from someone else.
+- The time in a state record comes from the client's clock, and the audit uses it too: when the newest record is older than `maxage`, that's a `stale` alarm. Only the witness timestamps come from someone else.
 - A witness has to know the log (origin and log key) before it cosigns anything. `init` prints the litewitness commands to register it. If a witness loses its database, the history it held is gone and the log has to be registered again.
 - Opening the log reads and hashes all of it in memory. Thousands of records are fine, millions would be too much. Log and witness signatures are Ed25519 only; post-quantum signatures (ML-DSA) aren't supported.
