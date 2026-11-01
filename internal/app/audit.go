@@ -103,7 +103,7 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 		ahead = rollback || fork
 	}
 
-	tail(r, l, n, ahead, len(witness.Cosigned(outs)) == len(ws))
+	tail(r, l, n, ahead, ctxErr == nil && len(witness.Cosigned(outs)) == len(ws))
 	checkFresh(r, cfg, now, st, v.Cosigs, outs)
 
 	switch {

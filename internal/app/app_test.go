@@ -679,6 +679,28 @@ func TestTailPastCheckpoint(t *testing.T) {
 	expect(t, "audit after the repair", e.audit(app.AuditOptions{}), app.ExitOK)
 }
 
+// TestTailWitnessDown leaves one witness down with an entry past the
+// checkpoint. Without an answer from every witness we can't tell if the
+// entry was cosigned. Record and audit must say to wait.
+func TestTailWitnessDown(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, 2, 2)
+	e.backupAndRecord(3)
+	e.appendFrames([]byte("junk frame"))
+	e.ws[1].SetDown(true)
+
+	for _, r := range []*app.Report{e.record(app.RecordOptions{}), e.audit(app.AuditOptions{})} {
+		if r.ExitCode() != app.ExitAlarm {
+			t.Errorf("%s: got exit %d, want %d", r.Command, r.ExitCode(), app.ExitAlarm)
+		}
+
+		d := strings.Join(finding(t, r, "tampered").Details, "\n")
+		if strings.Contains(d, "truncate") || !strings.Contains(d, "do not drop them before") {
+			t.Errorf("%s: got details %q, want advice to wait", r.Command, d)
+		}
+	}
+}
+
 // wantKeepAdvice wants the tail alarm of each report to say keep the
 // entries. A witness that's ahead may have cosigned them.
 func wantKeepAdvice(t *testing.T, reports ...*app.Report) {

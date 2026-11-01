@@ -130,7 +130,7 @@ What the client does with the answers:
 6. Ask the witnesses with `add-checkpoint`, sending `old = N` and the proof.
    Then write the checkpoint again, now with the log and witness lines. Fewer than `quorum` cosignatures raise `quorum`, but the checkpoint stays saved.
 
-N is always the checkpoint size, and `record` replays only those first N entries. If there are more, either the storage added them or an earlier run stopped between its append and its checkpoint write. In both cases no witness has seen them. They raise an alarm and are never signed.
+N is always the checkpoint size, and `record` replays only those first N entries. More entries can mean three things: the storage added them, an earlier run stopped between its append and its checkpoint write, or the storage put back an older checkpoint. They raise an alarm and are never signed. When every witness cosigned size N, none of them has seen the extra entries, and the alarm shows how to drop them. When a witness is ahead, the alarm says to keep them, because they may be records that witness cosigned.
 
 The newest checkpoint is kept also without a quorum. The `quorum` alarm says it's saved, and once the witnesses are back you can run `record` or `audit` again. If the run is cancelled after the quorum was reached, the cosignatures collected so far are kept. Any witness error other than a conflict ends up as a `witness` warning in the report.
 
