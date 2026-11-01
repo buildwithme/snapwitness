@@ -680,11 +680,11 @@ func TestTailPastCheckpoint(t *testing.T) {
 }
 
 // TestTailWitnessDown leaves one witness down with an entry past the
-// checkpoint. Without an answer from every witness we can't tell if the
-// entry was cosigned. Record and audit must say to wait.
+// checkpoint. The other one alone is a quorum, but we can't know if the down
+// one cosigned the entry. Record and audit must say to wait.
 func TestTailWitnessDown(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, 2, 2)
+	e := newEnv(t, 2, 1)
 	e.backupAndRecord(3)
 	e.appendFrames([]byte("junk frame"))
 	e.ws[1].SetDown(true)

@@ -103,7 +103,7 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 		ahead = rollback || fork
 	}
 
-	tail(r, l, n, ahead, ctxErr == nil && len(witness.Cosigned(outs)) == len(ws))
+	tail(r, l, n, ahead, everyWitnessCosigned(ctxErr, outs, ws))
 	checkFresh(r, cfg, now, st, v.Cosigs, outs)
 
 	switch {
@@ -427,7 +427,7 @@ func tail(r *Report, l *wlog.Log, n int64, ahead, allCosigned bool) bool {
 	case ahead:
 		advice = "do not drop them: a witness has seen a larger or different log, so they may be records it cosigned (see LIMITATIONS.md)"
 	case !allCosigned:
-		advice = "do not drop them before an audit where every witness answers and none has seen them (see LIMITATIONS.md)"
+		advice = "do not drop them before an audit that finishes in time, where every witness answers and none has seen them (see LIMITATIONS.md)"
 	default:
 		p := shellQuote(filepath.Join(l.Dir(), wlog.EntriesFile))
 		advice = fmt.Sprintf(
@@ -453,6 +453,13 @@ func tail(r *Report, l *wlog.Log, n int64, ahead, allCosigned bool) bool {
 // shellQuote quotes s as one word for a POSIX shell.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// everyWitnessCosigned reports whether all configured witnesses cosigned in a
+// run that wasn't cut short. Only then do we know that none has seen past the
+// checkpoint.
+func everyWitnessCosigned(ctxErr error, outs []witness.Outcome, ws []witness.Witness) bool {
+	return ctxErr == nil && len(witness.Cosigned(outs)) == len(ws)
 }
 
 // judge turns the witness answers for a checkpoint of size n into findings.
