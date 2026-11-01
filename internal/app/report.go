@@ -59,10 +59,24 @@ func (s *Severity) UnmarshalText(b []byte) error {
 	return fmt.Errorf("app: unknown severity %q", b)
 }
 
+// Kinds of findings, as the text and JSON reports show them.
+const (
+	KindDeleted    = "deleted"
+	KindRollback   = "rollback"
+	KindFork       = "fork"
+	KindStale      = "stale"
+	KindTampered   = "tampered"
+	KindUnrecorded = "unrecorded"
+	KindForeign    = "foreign"
+	KindWitness    = "witness"
+	KindClock      = "clock"
+	KindQuorum     = "quorum"
+)
+
 // Finding is one result line of a check.
 type Finding struct {
 	Severity Severity `json:"severity"`
-	Kind     string   `json:"kind"` // deleted, rollback, fork, stale, tampered, unrecorded, foreign, witness, clock, quorum
+	Kind     string   `json:"kind"` // one of the Kind constants
 	Message  string   `json:"message"`
 	Details  []string `json:"details,omitempty"`
 }

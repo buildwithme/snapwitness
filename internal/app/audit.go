@@ -66,7 +66,7 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 
 	st, err := state.Replay(l.Entries(n))
 	if err != nil {
-		r.Add(Alarm, "tampered", "the witnessed log records do not replay", err.Error())
+		r.Add(Alarm, KindTampered, "the witnessed log records do not replay", err.Error())
 		return nil
 	}
 
@@ -128,9 +128,9 @@ func audit(ctx context.Context, cfg *config.Config, wc *witness.Client, opts Aud
 			details[i] = fmt.Sprintf("missing %s recorded %s", id, st.IDs[id].Time.Format(state.TimeFormat))
 		}
 
-		r.Add(Alarm, "deleted", "the snapshots directory is gone", details...)
+		r.Add(Alarm, KindDeleted, "the snapshots directory is gone", details...)
 	default:
-		r.Add(Alarm, "tampered", "the snapshots directory cannot be read", fmt.Sprintf("%q", listErr.Error()))
+		r.Add(Alarm, KindTampered, "the snapshots directory cannot be read", fmt.Sprintf("%q", listErr.Error()))
 	}
 
 	r.line("log", "size %d, checkpoint %d, log key %08x", l.Size(), n, logKey.KeyHash())
@@ -159,12 +159,12 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 
 		r.Add(
 			Alarm,
-			"deleted",
+			KindDeleted,
 			fmt.Sprintf("%d of %d recorded snapshots missing from the storage", len(missing), len(st.IDs)),
 			details...)
 	}
 
-	if i := slices.IndexFunc(r.Findings, func(f Finding) bool { return f.Kind == "rollback" }); i >= 0 {
+	if i := slices.IndexFunc(r.Findings, func(f Finding) bool { return f.Kind == KindRollback }); i >= 0 {
 		details := []string{"likely: the storage was restored from an older copy"}
 		if m := st.MatchIndex(state.SetHash(listing.IDs)); m >= 0 {
 			details = append(details, fmt.Sprintf("the storage matches state #%d from %s", m+1, recordTime(l, m)))
@@ -176,7 +176,7 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 	if len(unrecorded) > 0 {
 		r.Add(
 			Warn,
-			"unrecorded",
+			KindUnrecorded,
 			plural(len(unrecorded), "snapshot")+" on the storage not in the log (a backup without record?)",
 			quote(unrecorded)...)
 	}
@@ -184,7 +184,7 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 	if len(listing.Mismatch) > 0 {
 		r.Add(
 			Alarm,
-			"tampered",
+			KindTampered,
 			plural(len(listing.Mismatch), "snapshot file")+" changed in place: the content does not match the name",
 			quote(listing.Mismatch)...)
 	}
@@ -192,7 +192,7 @@ func compare(r *Report, l *wlog.Log, st *state.State, listing *restic.Listing) {
 	if foreign := slices.Concat(listing.Foreign, listing.TooShort); len(foreign) > 0 {
 		r.Add(
 			Warn,
-			"foreign",
+			KindForeign,
 			plural(len(foreign), "file")+" in snapshots/ that restic would not read",
 			quote(foreign)...)
 	}
@@ -249,7 +249,7 @@ func checkFresh(
 		t := future[name]
 		r.Add(
 			Warn,
-			"clock",
+			KindClock,
 			fmt.Sprintf(
 				"witness %s cosigned at %s, %s in the future: check its clock and this one",
 				name,
@@ -270,7 +270,7 @@ func checkFresh(
 	if fresh < cfg.Quorum {
 		r.Add(
 			Alarm,
-			"stale",
+			KindStale,
 			fmt.Sprintf(
 				"%d of %d witnesses vouched for this log in the last %s, quorum is %d",
 				fresh,
@@ -284,7 +284,7 @@ func checkFresh(
 	if st.Last != nil && now.Sub(st.Last.Time) > cfg.MaxAge {
 		r.Add(
 			Alarm,
-			"stale",
+			KindStale,
 			fmt.Sprintf(
 				"no new state recorded for %s (last %s)",
 				now.Sub(st.Last.Time).Round(time.Minute),
@@ -355,10 +355,10 @@ func readStored(r *Report, dir string, logKey note.Verifier, witnessKeys []note.
 	l, err := wlog.Open(dir)
 	switch {
 	case errors.Is(err, wlog.ErrNoLog):
-		r.Add(Alarm, "deleted", "the log is gone from the storage")
+		r.Add(Alarm, KindDeleted, "the log is gone from the storage")
 		return nil, nil
 	case err != nil:
-		r.Add(Alarm, "tampered", "the log cannot be read: "+err.Error())
+		r.Add(Alarm, KindTampered, "the log cannot be read: "+err.Error())
 		return nil, nil
 	}
 
@@ -367,10 +367,10 @@ func readStored(r *Report, dir string, logKey note.Verifier, witnessKeys []note.
 
 	switch {
 	case errors.Is(err, wlog.ErrNoCheckpoint):
-		r.Add(Alarm, "deleted", "the checkpoint is gone from the storage")
+		r.Add(Alarm, KindDeleted, "the checkpoint is gone from the storage")
 		return l, nil
 	case err != nil:
-		r.Add(Alarm, "tampered", "the log cannot be read: "+err.Error())
+		r.Add(Alarm, KindTampered, "the log cannot be read: "+err.Error())
 		return l, nil
 	}
 
@@ -383,14 +383,14 @@ func readStored(r *Report, dir string, logKey note.Verifier, witnessKeys []note.
 func checkStored(r *Report, l *wlog.Log, cp []byte, logKey note.Verifier, witnessKeys []note.Verifier) *wlog.Verified {
 	v, err := wlog.Verify(cp, logKey, witnessKeys)
 	if err != nil {
-		r.Add(Alarm, "tampered", "the checkpoint does not verify", err.Error())
+		r.Add(Alarm, KindTampered, "the checkpoint does not verify", err.Error())
 		return nil
 	}
 
 	if v.Size > l.Size() {
 		r.Add(
 			Alarm,
-			"tampered",
+			KindTampered,
 			fmt.Sprintf("log truncated: the checkpoint covers %d entries, the storage serves %d", v.Size, l.Size()),
 		)
 
@@ -399,7 +399,7 @@ func checkStored(r *Report, l *wlog.Log, cp []byte, logKey note.Verifier, witnes
 
 	root, err := l.Root(v.Size)
 	if err != nil || root != v.Root {
-		r.Add(Alarm, "tampered", fmt.Sprintf("the first %d log entries do not match the checkpoint root", v.Size))
+		r.Add(Alarm, KindTampered, fmt.Sprintf("the first %d log entries do not match the checkpoint root", v.Size))
 		return nil
 	}
 
@@ -442,7 +442,7 @@ func tail(r *Report, l *wlog.Log, n int64, ahead, allCosigned bool) bool {
 
 	r.Add(
 		Alarm,
-		"tampered",
+		KindTampered,
 		entries+" past the checkpoint: the storage added them, or a record run stopped between its append and its checkpoint write",
 		advice,
 	)
@@ -484,20 +484,20 @@ func judge(r *Report, outs []witness.Outcome, n int64, ctxErr error, warned map[
 			forked = append(forked, o.Witness)
 		case !warned[o.Witness]:
 			warned[o.Witness] = true
-			r.Add(Warn, "witness", o.Err.Error())
+			r.Add(Warn, KindWitness, o.Err.Error())
 		}
 	}
 
 	if len(ahead) > 0 {
 		r.Add(
 			Alarm,
-			"rollback",
+			KindRollback,
 			fmt.Sprintf("%s seen log size %d, the storage's checkpoint is size %d", who(ahead), seen, n),
 		)
 	}
 
 	if len(forked) > 0 {
-		r.Add(Alarm, "fork", fmt.Sprintf("%s cosigned a different log at size %d", who(forked), n))
+		r.Add(Alarm, KindFork, fmt.Sprintf("%s cosigned a different log at size %d", who(forked), n))
 	}
 
 	return len(ahead) > 0, len(forked) > 0

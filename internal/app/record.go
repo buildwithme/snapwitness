@@ -108,7 +108,7 @@ func record(
 
 	st, err := state.Replay(l.Entries(n))
 	if err != nil {
-		r.Add(Alarm, "tampered", "the log records do not replay", err.Error())
+		r.Add(Alarm, KindTampered, "the log records do not replay", err.Error())
 		return nil
 	}
 
@@ -136,7 +136,7 @@ func record(
 
 		r.Add(
 			Alarm,
-			"deleted",
+			KindDeleted,
 			plural(len(removed), "recorded snapshot")+" gone from the repository",
 			append(details, removedHint)...)
 
@@ -219,7 +219,7 @@ func record(
 
 	r.Add(
 		Alarm,
-		"quorum",
+		KindQuorum,
 		fmt.Sprintf(
 			"%d of %d witnesses cosigned size %d, quorum is %d: the checkpoint is saved; run snapwitness record or audit again when the witnesses are back",
 			len(cosigs),
