@@ -37,11 +37,14 @@ The files it makes stay in `demo/.work` and `demo/.bin` for you to look at. `DEM
 snapwitness init   -c snapwitness.conf -name demo -repo DIR -log DIR -witness VKEY=URL [-witness ...] -quorum N [-maxage 26h]
 snapwitness record -c snapwitness.conf [-restic restic] [-accept-removed] [-json]
 snapwitness audit  [-c a.conf -c b.conf ...] [-offline] [-workers N] [-timeout 2m] [-json]
+snapwitness version
 ```
 
 - `init` creates the log key, the log and the config file. The config is the trust anchor: keep a copy of it next to your restic password.
 - `record` runs after every backup. It reads the snapshot list (this needs the restic password), appends a state record to the log and asks the witnesses to cosign the new checkpoint.
 - `audit` can run on any machine. It doesn't need the restic password or the log signing key. It compares what is on the storage with the log and with the witnesses.
+
+Every command takes `-v` for debug output on stderr.
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 alarm.
 
