@@ -218,6 +218,16 @@ I kept the dependencies few: `golang.org/x/mod`, `golang.org/x/sync` and `github
 
 One config file is the trust anchor. `init` writes the origin, the log public key, the witness keys and the quorum into it, and an auditor with a copy needs nothing else.
 
+## Numbers
+
+From `make bench` on an Apple M4 Pro (macOS 26.6, Go 1.26.0):
+
+- Replaying 5,000 records takes about 0.39 s and allocates about 220 MB. Every record copies and hashes the whole set again, which makes Replay quadratic in the number of records. Fine for years of daily backups, but it's the first thing to fix for bigger logs.
+- Opening a log of 10,000 entries of 200 bytes takes about 3 ms.
+- Listing and hashing 2,000 snapshot files of about 500 bytes takes about 46 ms with one worker and 27 ms with eight.
+- Verifying a checkpoint with three cosignatures takes about 0.12 ms.
+- One `Collect` round against three in-process witnesses takes about 0.17 ms. With real witnesses the network is all that counts.
+
 ## Limits
 
 The known limits are in [LIMITATIONS.md](../LIMITATIONS.md).

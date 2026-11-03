@@ -37,6 +37,8 @@ func (s *State) Apply(index int64, r *Record) error {
 // apply is Apply with the current set passed in sorted, and it returns the
 // new set sorted too. Replay carries it from record to record, which saves
 // sorting the map each time.
+//
+// TODO: quadratic, every record copies and hashes the whole set.
 func (s *State) apply(index int64, r *Record, cur []string) ([]string, error) {
 	if index != s.Size {
 		return nil, fmt.Errorf("state: record %d: out of order, want index %d", index, s.Size)
